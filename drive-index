@@ -50,6 +50,7 @@ QUIET, TERSE, NORMAL, VERBOSE, DEBUG = range(5)
 
 MARKER = ".volume-id"
 DEFAULT_MODEL = "/var/mlocate/{name}.db"
+LEGACY_HOME_CONFIG = ".updatedb.rc"
 STALE_DAYS = 90
 SHRINK_RATIO = 0.5
 
@@ -181,7 +182,10 @@ a label's own setting still wins. <name> is the system name -- Cygwin, Linux
 -- and DRIVE_INDEX_OS overrides it.
 
 Config is read from /etc/{prog}.conf, then the XDG system directories, then
-~/.{prog}.ini, then $XDG_CONFIG_HOME/{prog}/ -- each merging over the last.
+~/.updatedb.rc, then ~/.{prog}.ini, then $XDG_CONFIG_HOME/{prog}/ -- each
+merging over the last. The two home-directory names hold the same format;
+.{prog}.ini is canonical and is read last, so it wins where both exist, and
+that both were read is said rather than left to be noticed.
 There is deliberately no per-directory layer: which database belongs to a
 drive is a fact about the machine, not about the directory you stand in.
 
@@ -368,6 +372,11 @@ def config_candidates():
     for entry in reversed([d for d in dirs.split(":") if d]):
         files.extend(_directory_tier(os.path.join(entry, PROG)))
 
+    # Two names in this tier. .drive-index.ini is the canonical one and is
+    # read last so it wins; .updatedb.rc is what the scripts this replaced
+    # were configured by, and a machine that still carries one should not
+    # have to be renamed before anything works. Both hold the same format.
+    files.append(os.path.join(home, LEGACY_HOME_CONFIG))
     files.append(os.path.join(home, ".%s.ini" % PROG))
     xdg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
     files.extend(_directory_tier(os.path.join(xdg_home, PROG)))
@@ -378,6 +387,22 @@ def _directory_tier(directory):
     found = [os.path.join(directory, "config.ini")]
     found.extend(sorted(glob.glob(os.path.join(directory, "conf.d", "*.ini"))))
     return found
+
+
+def config_summary(config):
+    """What was read -- or, when nothing was, where it looked.
+
+    A bare "none" answers the wrong question. The reader already knows no
+    config was found; what they need is the list of names that would have
+    been, which is the difference between a minute and an afternoon when a
+    file is sitting in the home directory under a name nobody searches.
+    """
+    if config.files():
+        return ["config files read: %s" % ", ".join(config.files())]
+    lines = ["no config file was found; these names were looked for:"]
+    lines.extend("  " + path for path in (config.searched
+                                          or config_candidates()))
+    return lines
 
 
 def is_drive_letter(label):
@@ -394,6 +419,7 @@ class Config(object):
 
     def __init__(self, layers):
         self.layers = layers
+        self.searched = []
         self.alias = {}
         self.group = {}
         self._build_alias_map()
@@ -501,6 +527,7 @@ class Config(object):
 
     @classmethod
     def load(cls, paths, reporter):
+        searched = list(paths)
         layers = []
         for path in paths:
             if not os.path.isfile(path):
@@ -512,7 +539,19 @@ class Config(object):
                 raise Failure("cannot parse %s: %s" % (path, exc))
             layers.append((path, parser))
             reporter.say(VERBOSE, "config: read %s" % path)
-        return cls(layers)
+        found = cls(layers)
+        found.searched = searched
+        # Two names for one tier is a convenience until both exist, at which
+        # point which one is in force stops being obvious. Said plainly
+        # rather than left to be discovered through a value that will not
+        # take effect.
+        home = [p for p, _ in found.layers
+                if os.path.basename(p) in (LEGACY_HOME_CONFIG,
+                                           ".%s.ini" % PROG)]
+        if len(home) > 1:
+            reporter.say(NORMAL, "both %s are read; the later wins where "
+                                 "they disagree" % " and ".join(home))
+        return found
 
     def _build_alias_map(self):
         """Resolve aliases once, refusing the two ways they can go wrong.
@@ -686,9 +725,7 @@ def tool(settings, name):
                       % name, EX_TOOL, [
                           "set %s in [defaults], or in [os.%s] where the two "
                           "systems differ" % (name, os_name()),
-                          "config files read: %s"
-                          % (", ".join(settings.config.files()) or "none"),
-                      ])
+                      ] + config_summary(settings.config))
     resolved = expand(value)
     if not os.path.isfile(resolved):
         where, contents = nearest_existing(resolved)
@@ -753,8 +790,7 @@ class Drive(object):
                               "a single letter needs no configuration; "
                               "anything else needs a [drive.%s] section"
                               % self.label,
-                              "config files read: %s"
-                              % (", ".join(settings.config.files()) or "none"),
+                          ] + config_summary(settings.config) + [
                               "the section wants at least a root, or a "
                               "database alone if the index was built "
                               "elsewhere and copied here",
@@ -1013,8 +1049,7 @@ def do_locate(drive, config, settings, reporter, patterns, extra=(),
         if not drives:
             raise Failure("no index is held for any configured label",
                           EX_NO_DATABASE,
-                          ["config files read: %s"
-                           % (", ".join(config.files()) or "none")])
+                          config_summary(config))
     else:
         drive.require_database()
         drives = [drive]
@@ -1346,8 +1381,7 @@ def do_install(config, settings, reporter, labels):
         raise UsageError("no labels to install", [
             "name them: %s install c d" % PROG,
             "or give each one a [drive.<label>] section",
-            "config files read: %s" % (", ".join(config.files()) or "none"),
-        ])
+        ] + config_summary(config))
 
     dry = settings.get("dry-run", default=False, kind=as_bool)
     force = settings.get("force", default=False, kind=as_bool)
@@ -1443,8 +1477,7 @@ def do_status(config, settings, reporter, words):
     if not labels:
         raise UsageError("no labels to report on", [
             "name them: %s status c d" % PROG,
-            "config files read: %s" % (", ".join(config.files()) or "none"),
-        ])
+        ] + config_summary(config))
     rows = _survey(config, settings.args, labels)
 
     if settings.get("format", default=None) == "json":
@@ -1486,8 +1519,7 @@ def do_bulk(config, settings, reporter, words):
     if not labels:
         raise UsageError("no labels to rebuild", [
             "name them: %s bulk c d" % PROG,
-            "config files read: %s" % (", ".join(config.files()) or "none"),
-        ])
+        ] + config_summary(config))
 
     built, skipped, failed = [], [], []
     for label in labels:
@@ -1769,9 +1801,7 @@ def main(argv):
                 "name one: %s c locate PATTERN" % PROG,
                 "or set default_drive in [defaults], or in [os.%s] where "
                 "two systems differ" % os_name(),
-                "config files read: %s"
-                % (", ".join(config.files()) or "none"),
-            ])
+            ] + config_summary(config))
         label = label.strip()
         defaulted = True
     label = config.resolve(label)

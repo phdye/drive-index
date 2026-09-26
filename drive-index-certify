@@ -799,6 +799,62 @@ contains "B30 -c says trimming cannot apply"  "does not apply" "${TR[@]}" \
 contains "B30 config reports the trim"        "trim ${fix}/tree" "${TR[@]}" \
          config t
 
+
+#-----------------------------------------------------------------------------
+# B31 -- two names for the home-directory config, and a diagnostic that says
+# where it looked. The reported failure was a file sitting in the home
+# directory under a name nothing searched, reported as "none".
+#-----------------------------------------------------------------------------
+
+alt=$(mktemp -d)
+mkdir -p "${alt}/tree"
+: > "${alt}/tree/gamma-file"
+body="[drive.t]
+root = ${alt}/tree
+database = ${alt}/t.db"
+
+# Neither name present: the failure names every path it tried.
+check "B31 no config at all is a usage error" 2 env HOME="$alt" \
+      DRIVE_INDEX_CONFIG= "$python" "$prog" install
+contains "B31 and lists what it looked for"   "were looked for" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" install
+contains "B31 including the legacy name"      ".updatedb.rc" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" install
+contains "B31 including the canonical name"   ".drive-index.ini" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" install
+
+# The legacy name alone is enough.
+printf '%s\n' "$body" > "${alt}/.updatedb.rc"
+contains "B31 the legacy name is read"        "updatedb.rc" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" config
+check "B31 and install works from it"         0 env HOME="$alt" \
+      DRIVE_INDEX_CONFIG= "$python" "$prog" -n install
+
+# The canonical name alone is enough.
+rm -f "${alt}/.updatedb.rc"
+printf '%s\n' "$body" > "${alt}/.drive-index.ini"
+check "B31 the canonical name is read"      0 env HOME="$alt" \
+      DRIVE_INDEX_CONFIG= "$python" "$prog" -n install
+
+# Both present: the canonical one wins, and the ambiguity is reported
+# rather than left to be discovered through a value that never takes effect.
+printf '[drive.t]\nroot = %s/tree\ndatabase = %s/legacy.db\n' \
+    "$alt" "$alt" > "${alt}/.updatedb.rc"
+contains "B31 the canonical name wins"        "${alt}/t.db" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" config t
+contains "B31 and both being read is said"    "both" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" config t
+
+# A key repeated inside one file is refused by the parser, and the refusal
+# names the file and the line rather than silently taking one of them.
+printf '[drive.t]\nroot = %s/tree\ndatabase = a\ndatabase = b\n' \
+    "$alt" > "${alt}/.drive-index.ini"
+check "B31 a duplicated key is refused"     1 env HOME="$alt" \
+      DRIVE_INDEX_CONFIG= "$python" "$prog" config t
+contains "B31 and names the file and line"    "already exists" env \
+         HOME="$alt" DRIVE_INDEX_CONFIG= "$python" "$prog" config t
+rm -rf "$alt"
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -100,7 +100,10 @@ When you add an option, edit both.
 
 **Diagnostics carry provenance.** A failure names the value, where it came
 from (option, environment, which config file, or the default), what was
-tried, and what exists nearby. This is not decoration: a config key that was
+tried, and what exists nearby. When no config was found at all, the failure
+lists every name that was looked for -- reporting `none` answers the wrong
+question, and a config sitting under an unsearched name reads as no config
+at all. This is not decoration: a config key that was
 never read passed its tests for a whole session because the configured value
 and the built-in default happened to be the same string.
 
