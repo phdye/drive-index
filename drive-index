@@ -1,0 +1,1712 @@
+#!/usr/bin/env python3
+"""Drive-scoped wrappers around GNU locate and updatedb.
+
+One program serves every <label>-<action> symlink. The name it was invoked
+under carries both the label and the verb, so c-locate and 4tb-updatedb are
+the same executable reached by two different paths.
+
+This wraps the system updatedb rather than reimplementing it: builds go to a
+temporary output path and are renamed into place only once they look sane, so
+a failed or truncated run cannot destroy an index that took an hour to make.
+That matters more here than usual, because most of these indexes describe
+disks that are not attached -- the index is often the only copy of what is on
+them.
+
+Written to the Python 3.6 line, since this has to run on RHEL 8.10 as well as
+on Cygwin.
+"""
+
+import argparse
+import configparser
+import filecmp
+import glob
+import json
+import os
+import platform
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+PROG = "drive-index"
+VERSION = "2.0.0"
+
+EX_OK = 0
+EX_FAIL = 1
+EX_USAGE = 2
+EX_NO_DATABASE = 3
+EX_TOOL = 4
+EX_VOLUME = 5
+EX_SUSPECT = 6
+
+ACTIONS = ("locate", "updatedb")
+ADMIN = ("install", "config", "status", "bulk")
+
+QUIET, TERSE, NORMAL, VERBOSE, DEBUG = range(5)
+
+MARKER = ".volume-id"
+DEFAULT_MODEL = "/var/mlocate/{name}.db"
+STALE_DAYS = 90
+SHRINK_RATIO = 0.5
+
+# Read from `locate --help` on findutils 4.11.0 rather than recalled. A group
+# selector matching one of these would be stolen from locate, so the set has
+# to be known here to refuse it. --existing and --non-existing appear in the
+# usage line collapsed as --[non-]existing and are spelled out.
+LOCATE_OPTIONS = frozenset("""
+-0 -A --all -b --basename -c --count -d --database -e -E --existing
+--non-existing --follow -H --help -i --ignore-case -l -L --limit -m
+--max-database-age --mmap --nofollow --null -p -P --print -r --regex
+--regextype -s -S --statistics --stdio --version -w --wholename
+""".split())
+
+USAGE = """\
+{prog} {version} -- drive-scoped locate and updatedb.
+
+Usage:
+  <label>-locate [options] [--] PATTERN...
+  <label>-updatedb [options]
+  {prog} LABEL locate [options] [--] PATTERN...
+  {prog} LABEL updatedb [options]
+  {prog} install [options] [--] [LABEL...]
+  {prog} status [options] [--] [LABEL...]
+  {prog} bulk [options] [--] [LABEL...]
+  {prog} config [options] [LABEL]
+  {prog} (-h | --help)
+  {prog} (-V | --version)
+
+Reached through a symlink named <label>-<action>, the label and the action
+come from that name, split at the last dash -- so 4tb-locate and c-all-locate
+work as well as c-locate. Reached under its own name, they are the first two
+arguments instead, so nothing needs a symlink to be tested.
+
+A single-letter label is a drive and needs no configuration: its root is
+/<letter>/ and its database follows db_file_model, by default
+/var/mlocate/{{name}}.db. Single letters are reserved to drives, so an alias
+of one letter is a configuration error rather than a silent hijacking.
+
+Any other label names something that cannot be guessed and needs a
+[drive.<label>] section. A label with no root is an index built elsewhere and
+copied here: it can be searched but never built, since a build would replace
+another machine's filesystem with a scan of a path that does not exist.
+
+A [group.<name>] section reaches several labels under one name, narrowed by a
+selector of its own:
+
+    [group.app]
+    default = all
+    member.dev  = x
+    member.test = y
+    member.prod = z
+
+app-locate searches all three; app-locate --prod searches one;
+--dev --prod searches two. app-updatedb builds all three, in the order
+the file lists them. Indexing only reads a root, so building more than was
+meant costs time rather than damage, while searching fewer than was meant
+produces a finding about the wrong system -- so all is the default, and it is
+narrowing that gets announced.
+
+A selector may not be an option of this program or of locate, since either
+would consume it before the group was reached, and may not name another
+group. All of it is refused when the file is read.
+
+Options:
+  -h, --help            Show this text and exit.
+  -V, --version         Show the version and exit.
+  -v, --verbose         Increase detail; repeatable.
+      --no-verbose      Drop detail asked for by config or environment.
+  -t, --terse           Trim output to essentials.
+      --no-terse        Cancel a terse setting from config or environment.
+  -q, --quiet           Errors only.
+      --no-quiet        Cancel a quiet setting from config or environment.
+  -d, --debug           Trace what runs; implies --verbose.
+      --no-debug        Cancel a debug setting from config or environment.
+      --json            Emit JSON.
+      --porcelain       Emit stable plain text, one record per line.
+      --color WHEN      always, never or auto. [default: auto]
+      --no-color        Alias for --color never.
+  -o, --output FILE     Write results here; - is stdout. [default: -]
+      --config FILE     Read this file alone, discarding the merge stack.
+      --into DIR        install: place the program and its symlinks in DIR
+                        rather than beside the running copy. This is the
+                        deployment step: the repository is the source of
+                        record, and a copy is placed where it runs from at a
+                        moment somebody chose rather than whenever a file is
+                        saved.
+  -n, --dry-run         Say what would happen; change nothing.
+      --no-dry-run      Act, overriding a dry-run set elsewhere.
+  -f, --force           Replace whatever is in the way, and accept a built
+                        index that looks suspect.
+      --no-force        Refuse to replace anything. [default]
+  -a, --all-indexes     locate: search every index held, not just one.
+      --root DIR        Override this label's root for one run.
+      --db FILE         Override this label's database for one run.
+      --prune PATH      Prune PATH as well as the configured set; repeatable.
+      --no-prune        Prune nothing at all.
+      --log FILE        Send updatedb's diagnostics here.
+  -e, --existing        locate: drop hits that no longer exist.
+      --no-existing     locate: report hits unchecked. [default]
+  -i, --ignore-case     locate: match regardless of case.
+      --no-ignore-case  locate: match case-sensitively. [default]
+  -l, --limit N         locate: stop after N matches.
+      --regextype TYPE  locate: which regex dialect -r uses.
+      --max-database-age D    locate: warn past this age in days.
+
+Anything else given to a locate is handed to locate untouched -- -r, -b, -w,
+-A, -p, -0, -c, -S, -E, and the follow flags -- and locate rejects what it
+does not know, in its own words. Wrapping a tool is no reason to narrow it.
+
+Four short options mean something here that they do not mean to locate, and
+this program wins: -d is --debug where locate reads it as --database (use
+--db), -q is the volume control rather than locate's --quiet, -a searches
+every index where locate's -A is --all, and -l is a limit in both. The long
+--all reaches locate unchanged.
+
+-c, -0 and -S make locate emit something other than one path per line, so
+its output passes through untouched and its exit status stands; --json has
+nothing to describe in that case and says so.
+
+Every option has an environment counterpart named DRIVE_INDEX_<OPTION>, and
+most may be written in a config file too. Precedence runs option, then
+environment, then config, then the built-in default.
+
+Config is read from /etc/{prog}.conf, then the XDG system directories, then
+~/.{prog}.ini, then $XDG_CONFIG_HOME/{prog}/ -- each merging over the last.
+There is deliberately no per-directory layer: which database belongs to a
+drive is a fact about the machine, not about the directory you stand in.
+
+Section keys:
+  root              What to scan. Absent means the index was built elsewhere.
+  database          Where the index lives; overrides db_file_model.
+  db_file_model     Template over {{name}}, {{host}} and {{os}}.
+  alias             Other names for this entry. Never a single letter.
+  volume            Expected contents of <root>/{marker}, checked before any
+                    build, so a disk mounted where another used to be cannot
+                    be indexed under the wrong name.
+  removable         yes if the root is expected to be absent much of the time.
+  bulk              no to keep this entry out of a bulk rebuild.
+  prunepaths        Replaces the inherited prune set.
+  add_prunepaths    Extends it. Neither may contain whitespace.
+
+Exit codes:
+  0  success
+  1  nothing matched, or the run failed
+  2  usage error
+  3  the index is missing or unreadable
+  4  locate or updatedb itself failed
+  5  the volume mounted here is not the one expected
+  6  the build produced an index that looks wrong, and was discarded
+""".format(prog=PROG, version=VERSION, marker=MARKER)
+
+
+class Failure(Exception):
+    """Anything that ends the run with a named exit code.
+
+    `detail` is the diagnostic block. On a failure whose cause is not plain
+    from the first line, the reader gets the evidence here rather than having
+    to rerun anything to find it.
+    """
+
+    def __init__(self, message, code=EX_FAIL, detail=None):
+        Exception.__init__(self, message)
+        self.message = message
+        self.code = code
+        self.detail = detail or []
+
+
+class UsageError(Failure):
+    def __init__(self, message, detail=None):
+        Failure.__init__(self, message, EX_USAGE, detail)
+
+
+def environment_facts():
+    return [
+        "interpreter: %s (%s)" % (sys.executable, platform.python_version()),
+        "invoked as:  %s" % sys.argv[0],
+        "platform:    %s" % sys.platform,
+        "cwd:         %s" % os.getcwd(),
+    ]
+
+
+def nearest_existing(path):
+    """Deepest ancestor of `path` that exists, and what sits in it."""
+    probe = os.path.abspath(os.path.expanduser(path))
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None, []
+        probe = parent
+    try:
+        return probe, sorted(os.listdir(probe))[:12]
+    except OSError as exc:
+        return probe, ["<unreadable: %s>" % exc]
+
+
+def host_name():
+    return socket.gethostname().split(".")[0]
+
+
+def os_name():
+    system = platform.system()
+    return "Cygwin" if system.startswith("CYGWIN") else system
+
+
+def age_in_days(path):
+    try:
+        return (time.time() - os.path.getmtime(path)) / 86400.0
+    except OSError:
+        return None
+
+
+class Reporter(object):
+    """Diagnostics to stderr, results to stdout, and the volume ladder."""
+
+    def __init__(self, level=NORMAL, color="auto"):
+        self.level = level
+        self.color = self._decide_color(color)
+
+    @staticmethod
+    def _decide_color(when):
+        if when == "never" or os.environ.get("NO_COLOR") is not None:
+            return False
+        if when == "always":
+            return True
+        return sys.stderr.isatty()
+
+    def paint(self, text, code):
+        return text if not self.color else "\033[%sm%s\033[0m" % (code, text)
+
+    def say(self, level, text):
+        if self.level >= level:
+            sys.stderr.write(text.rstrip("\n") + "\n")
+
+    def error(self, text):
+        sys.stderr.write("%s: %s\n" % (self.paint(PROG, "1;31"), text))
+
+    def detail(self, lines):
+        for line in lines:
+            sys.stderr.write("  %s\n" % line)
+
+
+def _flags(getter):
+    out = {}
+    for name in ("debug", "verbose", "terse", "quiet"):
+        raw = getter(name)
+        if raw is None or raw == "":
+            out[name] = None
+        elif isinstance(raw, (bool, int)):
+            out[name] = bool(raw)
+        else:
+            out[name] = as_bool(raw)
+    return out
+
+
+def volume_from(args, env, cfg):
+    """Loudest wins within one source; across sources, normal precedence."""
+    for source in (args, env, cfg):
+        if source is None:
+            continue
+        if source.get("debug"):
+            return DEBUG
+        if source.get("verbose"):
+            return VERBOSE
+        if source.get("terse"):
+            return TERSE
+        if source.get("quiet"):
+            return QUIET
+        if any(v is not None for v in source.values()):
+            return NORMAL
+    return NORMAL
+
+
+def as_bool(text):
+    lowered = str(text).strip().lower()
+    if lowered in ("1", "yes", "true", "on"):
+        return True
+    if lowered in ("0", "no", "false", "off"):
+        return False
+    raise Failure("not a boolean: %r" % text)
+
+
+def as_list(text):
+    return [item for item in str(text).split() if item]
+
+
+def config_candidates():
+    """The merge stack, least specific first."""
+    home = os.path.expanduser("~")
+    files = ["/etc/%s.conf" % PROG]
+
+    dirs = os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg"
+    # XDG runs the opposite way to every other list here: earlier entries win,
+    # so walk it in reverse and let the first one land last.
+    for entry in reversed([d for d in dirs.split(":") if d]):
+        files.extend(_directory_tier(os.path.join(entry, PROG)))
+
+    files.append(os.path.join(home, ".%s.ini" % PROG))
+    xdg_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    files.extend(_directory_tier(os.path.join(xdg_home, PROG)))
+    return files
+
+
+def _directory_tier(directory):
+    found = [os.path.join(directory, "config.ini")]
+    found.extend(sorted(glob.glob(os.path.join(directory, "conf.d", "*.ini"))))
+    return found
+
+
+def is_drive_letter(label):
+    return len(label) == 1 and label.isalpha()
+
+
+class Config(object):
+    """The merged stack, with the file each key came from kept alongside.
+
+    One parser per file rather than a single merged one, because a merged
+    parser cannot say where a value came from and the diagnostics here are
+    required to.
+    """
+
+    def __init__(self, layers):
+        self.layers = layers
+        self.alias = {}
+        self.group = {}
+        self._build_alias_map()
+        self._build_group_map()
+
+    def group_names(self):
+        found = []
+        for _, parser in self.layers:
+            for section in parser.sections():
+                if section.startswith("group.") and len(section) > 6:
+                    name = section[6:]
+                    if name not in found:
+                        found.append(name)
+        return found
+
+    def _group_options(self, name):
+        """Keys of one group, in the order the file lists them.
+
+        Config order is the build order, so the cheap environment can be put
+        first and a sweep is deterministic rather than dictionary-ordered.
+        """
+        ordered = []
+        for _, parser in self.layers:
+            section = "group.%s" % name
+            if parser.has_section(section):
+                for key in parser.options(section):
+                    pair = (key, parser.get(section, key))
+                    ordered = [p for p in ordered if p[0] != key]
+                    ordered.append(pair)
+        return ordered
+
+    def _build_group_map(self):
+        for name in self.group_names():
+            self._refuse_group_name(name)
+            default, members = None, []
+            for key, value in self._group_options(name):
+                if key == "default":
+                    default = value.strip()
+                elif key.startswith("member."):
+                    selector = key[7:]
+                    self._refuse_selector(name, selector)
+                    members.append((selector, value.strip()))
+            if not members:
+                raise Failure("[group.%s] names no members" % name, EX_USAGE,
+                              ["give it member.<selector> = <label> lines"])
+            self._refuse_members(name, members)
+            self.group[name] = Group(name, default, members)
+
+    def _refuse_group_name(self, name):
+        if is_drive_letter(name):
+            raise Failure("[group.%s] is a single letter" % name, EX_USAGE,
+                          ["single letters are reserved to drives"])
+        if name in self.labels():
+            raise Failure("%r is both a group and a label" % name, EX_USAGE,
+                          ["which one a name reached would depend on the "
+                           "order sections happen to be read in"])
+        if name in self.alias:
+            raise Failure("%r is both a group and an alias" % name, EX_USAGE,
+                          ["the alias points at %s" % self.alias[name]])
+
+    def _refuse_selector(self, group, selector):
+        """A selector has to survive two parsers to reach the group at all.
+
+        One matching an option this program owns is consumed before the
+        group is even known; one matching an option of locate's is stolen
+        from locate. Both are caught when the file is read, because the
+        symptom otherwise is a selector that silently does something else.
+        """
+        spelled = "--%s" % selector
+        if spelled in own_option_strings():
+            raise Failure(
+                "selector %s in [group.%s] is an option of this program"
+                % (spelled, group), EX_USAGE,
+                ["it would be parsed before the group was known",
+                 "pick a name that is not in --help"])
+        if spelled in LOCATE_OPTIONS:
+            raise Failure(
+                "selector %s in [group.%s] is an option of locate"
+                % (spelled, group), EX_USAGE,
+                ["unrecognized options are passed through to locate, so "
+                 "this would be taken from it"])
+
+    def _refuse_members(self, group, members):
+        seen = {}
+        for selector, label in members:
+            if label in self.group_names():
+                raise Failure(
+                    "member.%s of [group.%s] names a group" % (selector,
+                                                              group),
+                    EX_USAGE,
+                    ["groups do not nest; name its members instead"])
+            if not is_drive_letter(label) and label not in self.labels():
+                raise Failure(
+                    "member.%s of [group.%s] names %r, which is not a label"
+                    % (selector, group, label), EX_USAGE,
+                    ["a single letter needs no section; anything else needs "
+                     "a [drive.%s] one" % label])
+            if label in seen:
+                raise Failure(
+                    "[group.%s] names %r twice, as %s and %s"
+                    % (group, label, seen[label], selector), EX_USAGE,
+                    ["a sweep would build it twice and a search would "
+                     "report every hit in it twice"])
+            seen[label] = selector
+
+    @classmethod
+    def load(cls, paths, reporter):
+        layers = []
+        for path in paths:
+            if not os.path.isfile(path):
+                continue
+            parser = configparser.ConfigParser()
+            try:
+                parser.read(path)
+            except configparser.Error as exc:
+                raise Failure("cannot parse %s: %s" % (path, exc))
+            layers.append((path, parser))
+            reporter.say(VERBOSE, "config: read %s" % path)
+        return cls(layers)
+
+    def _build_alias_map(self):
+        """Resolve aliases once, refusing the two ways they can go wrong.
+
+        A one-letter alias would shadow a drive, which is the namespace this
+        program guarantees; two entries claiming one alias would make which
+        index you searched depend on section order. Both are caught when the
+        file is read rather than at the moment someone relies on them.
+        """
+        for label in self.labels():
+            for name in as_list(self.lookup(label, "alias")[0] or ""):
+                if is_drive_letter(name):
+                    raise Failure(
+                        "alias %r in [drive.%s] is a single letter"
+                        % (name, label), EX_USAGE, [
+                            "single letters are reserved to drives, so this "
+                            "would shadow drive %s" % name,
+                            "use a longer name: %s-all, %s-entire"
+                            % (name, name),
+                        ])
+                if name in self.alias and self.alias[name] != label:
+                    raise Failure(
+                        "alias %r is claimed by both %s and %s"
+                        % (name, self.alias[name], label), EX_USAGE,
+                        ["which index it reached would depend on the order "
+                         "the sections happen to be read in"])
+                if name in self.labels() and name != label:
+                    raise Failure(
+                        "alias %r is also a section name" % name, EX_USAGE,
+                        ["[drive.%s] exists, so the alias can never be "
+                         "reached" % name])
+                self.alias[name] = label
+
+    def resolve(self, label):
+        """A label, an alias for one, or a bare drive letter."""
+        if label is None:
+            return None
+        if label in self.labels():
+            return label
+        return self.alias.get(label, label)
+
+    def labels(self):
+        found = []
+        for _, parser in self.layers:
+            for section in parser.sections():
+                if section.startswith("drive.") and len(section) > 6:
+                    name = section[6:]
+                    if name not in found:
+                        found.append(name)
+        return found
+
+    def lookup(self, label, key):
+        """Last layer wins; a label's own section outranks [defaults]."""
+        sections = ["defaults"]
+        if label:
+            sections.append("drive.%s" % label)
+        hit = (None, None)
+        for path, parser in self.layers:
+            for section in sections:
+                if parser.has_option(section, key):
+                    hit = (parser.get(section, key), path)
+        return hit
+
+    def files(self):
+        return [path for path, _ in self.layers]
+
+
+class Group(object):
+    """Several labels reached under one name, narrowed by a selector.
+
+    An indirection, never an index. It resolves to a list of labels and
+    everything downstream is unchanged, so status, bulk, the sidecars and
+    the atomicity guard need no second code path.
+    """
+
+    def __init__(self, name, default, members):
+        self.name = name
+        self.default = default
+        self.members = members          # [(selector, label)], config order
+
+    def labels(self):
+        return [label for _, label in self.members]
+
+    def selectors(self):
+        return [selector for selector, _ in self.members]
+
+    def choose(self, passed):
+        """Pull this group's selectors out of the passthrough list.
+
+        Returns (labels, remaining). Selectors union rather than override, so
+        --dev --prod is two of three. Nothing chosen means every member: the
+        widening default is the safe one, since searching one environment
+        while believing you searched all of them is the case that misleads.
+        """
+        remaining, wanted = [], []
+        for item in passed:
+            name = item.split("=", 1)[0]
+            if name.startswith("--") and name[2:] in self.selectors():
+                if name[2:] not in wanted:
+                    wanted.append(name[2:])
+            else:
+                remaining.append(item)
+        if not wanted:
+            if self.default and self.default != "all":
+                wanted = [s for s in as_list(self.default)]
+            else:
+                return self.labels(), remaining
+        chosen = [label for selector, label in self.members
+                  if selector in wanted]
+        return chosen, remaining
+
+
+class Settings(object):
+    """Resolution with provenance kept, because the diagnostics need it."""
+
+    def __init__(self, args, config, label):
+        self.args = args
+        self.config = config
+        self.label = label
+        self.source = {}
+
+    def get(self, key, default=None, kind=str, env_key=None, config_key=None):
+        """Option, then environment, then config, then default.
+
+        `config_key` exists because the namespaces need not agree: the option
+        is --db while the config key is `database`, and using one string for
+        both silently skipped the config layer entirely.
+        """
+        option = getattr(self.args, key.replace("-", "_"), None)
+        if option is not None:
+            self.source[key] = "option"
+            return option
+
+        env_name = "DRIVE_INDEX_%s" % (env_key or key).replace("-", "_").upper()
+        if env_name in os.environ:
+            self.source[key] = "environment %s" % env_name
+            return kind(os.environ[env_name])
+
+        value, path = self.config.lookup(self.label, config_key or key)
+        if value is not None:
+            self.source[key] = "config %s" % path
+            return kind(value)
+
+        self.source[key] = "default"
+        return default
+
+
+def expand(path):
+    """Tilde only, deliberately.
+
+    Not expandvars: Windows has real directories named $Recycle.Bin, and
+    expanding that leaves /c/.Bin -- a prune path that prunes nothing.
+    """
+    return os.path.expanduser(path) if path else path
+
+
+def check_no_whitespace(paths, what, source):
+    """updatedb takes its path lists whitespace-separated, with no escape.
+
+    Wrapping updatedb rather than driving find directly is the deliberate
+    choice here, and this is its one real cost: a path containing a space
+    cannot be expressed to it at all. Refused loudly, since the alternative
+    is a path silently read as two that match nothing.
+    """
+    for path in paths:
+        if len(path.split()) > 1:
+            raise Failure("%s contains whitespace: %s" % (what, path),
+                          EX_USAGE, [
+                              "came from: %s" % source,
+                              "updatedb takes one whitespace-separated list, "
+                              "so this would be read as two paths and "
+                              "neither would match",
+                              "there is no escaping form; this program wraps "
+                              "updatedb rather than replacing it",
+                          ])
+
+
+class Drive(object):
+    """Everything known about one label: where it scans, where its index is.
+
+    A single-letter label is a drive and needs no configuration at all; that
+    is the common case by a wide margin. Anything else names something that
+    cannot be guessed, and must be described before it will run.
+    """
+
+    def __init__(self, label, settings):
+        self.label = label.lower()
+        self.settings = settings
+        self.is_drive = is_drive_letter(self.label)
+        self.root = expand(settings.get(
+            "root", default="/%s/" % self.label if self.is_drive else None))
+        self.database = expand(self._database())
+        if not self.is_drive and not self._has_section():
+            raise Failure("%s is not a drive letter and is not configured"
+                          % self.label, EX_USAGE, [
+                              "a single letter needs no configuration; "
+                              "anything else needs a [drive.%s] section"
+                              % self.label,
+                              "config files read: %s"
+                              % (", ".join(settings.config.files()) or "none"),
+                              "the section wants at least a root, or a "
+                              "database alone if the index was built "
+                              "elsewhere and copied here",
+                          ])
+        self.imported = not self.root
+        self.volume = settings.get("volume", default=None)
+        self.removable = settings.get(
+            "removable", default=False, kind=as_bool)
+        self.in_bulk = settings.get("bulk", default=True, kind=as_bool)
+        self.log = expand(settings.get(
+            "log", default="~/log/%s/%s-updatedb.log" % (PROG, self.label)))
+        self.prune = self._prune_set()
+
+    def _database(self):
+        explicit = self.settings.get(
+            "db", default=None, env_key="db", config_key="database")
+        if explicit:
+            return explicit
+        model = self.settings.get(
+            "db_file_model", default=DEFAULT_MODEL)
+        self.settings.source["db"] = self.settings.source.get("db_file_model")
+        try:
+            return model.format(name=self.label, host=host_name(),
+                                os=os_name())
+        except (KeyError, IndexError) as exc:
+            raise Failure("db_file_model is not usable: %s" % model,
+                          EX_USAGE, [
+                              "unknown field: %s" % exc,
+                              "the fields are {name}, {host} and {os}",
+                          ])
+
+    def _has_section(self):
+        """Whether this label is described, rather than merely resolvable.
+
+        Asked of the sections directly, not inferred from where a value came
+        from. An earlier version tested whether root and database had both
+        fallen through to their defaults, which quietly stopped working the
+        moment db_file_model appeared in [defaults]: every value then had a
+        config provenance, so an unknown label passed the guard and failed
+        much later as a missing index instead.
+
+        An explicit --root or --db is enough on its own, which is what lets
+        a one-off label be searched without writing a section for it.
+        """
+        if self.label in self.settings.config.labels():
+            return True
+        return bool(getattr(self.settings.args, "root", None)
+                    or getattr(self.settings.args, "db", None))
+
+    def _prune_set(self):
+        """prunepaths replaces the inherited set; add_prunepaths extends it.
+
+        Stated in config rather than inherited from whatever updatedb was
+        compiled with, so `config` can show the effective set and say where
+        each part came from.
+        """
+        if getattr(self.settings.args, "no_prune", False):
+            self.settings.source["prune"] = "option --no-prune"
+            return []
+        base, base_path = self.settings.config.lookup(self.label, "prunepaths")
+        extra, extra_path = self.settings.config.lookup(
+            self.label, "add_prunepaths")
+        paths = as_list(base or "") + as_list(extra or "")
+        where = [p for p in (base_path, extra_path) if p]
+        self.settings.source["prune"] = (
+            "config %s" % where[-1]) if where else "default"
+        option = getattr(self.settings.args, "prune", None) or []
+        if option:
+            self.settings.source["prune"] += " plus --prune"
+        paths = [expand(p) for p in paths + list(option)]
+        check_no_whitespace(paths, "prune path",
+                            self.settings.source["prune"])
+        return paths
+
+    def require_database(self):
+        if os.path.isfile(self.database):
+            return
+        where, contents = nearest_existing(self.database)
+        detail = ["database: %s" % self.database,
+                  "came from: %s" % self.settings.source.get("db", "default")]
+        if where:
+            detail.append("deepest existing ancestor: %s" % where)
+            detail.append("  holding: %s" % (", ".join(contents) or "<empty>"))
+        detail.extend(environment_facts())
+        detail.append(
+            "reading: the index has not been built yet, or --db points "
+            "somewhere else" if self.imported else
+            "reading: the index has not been built yet; %s-updatedb builds it"
+            % self.label)
+        raise Failure("no index for %s" % self.label, EX_NO_DATABASE, detail)
+
+    def check_volume(self):
+        """Refuse to build when the disk mounted here is not the expected one.
+
+        With fixed mount points this should never fire. When it does, it has
+        caught a rebuild that would have relabelled one disk's index with
+        another disk's contents -- which for an index you consult offline is
+        worse than having no index, because you would believe it.
+        """
+        if not self.volume:
+            return
+        marker = os.path.join(self.root, MARKER)
+        try:
+            with open(marker) as handle:
+                found = handle.read().strip()
+        except IOError as exc:
+            raise Failure("cannot read the volume marker at %s" % marker,
+                          EX_VOLUME, [
+                              "%s" % exc,
+                              "expected it to contain: %s" % self.volume,
+                              "every volume indexed by name needs one, so a "
+                              "disk cannot be indexed as its predecessor",
+                          ])
+        if found != self.volume:
+            raise Failure("wrong volume mounted at %s" % self.root,
+                          EX_VOLUME, [
+                              "expected: %s" % self.volume,
+                              "found:    %s" % found,
+                              "building would overwrite %s with an index of "
+                              "whatever is mounted here now" % self.database,
+                          ])
+
+
+def run(argv, reporter, stderr_to=None):
+    reporter.say(DEBUG, "run: %s" % " ".join(argv))
+    if stderr_to is None:
+        return subprocess.run(argv, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE,
+                              universal_newlines=True)
+    with open(stderr_to, "ab") as handle:
+        return subprocess.run(argv, stderr=handle)
+
+
+def index_count(database, reporter):
+    """How many paths an index holds, or None if locate will not say."""
+    result = run(["locate", "-d", database, "-c", "--regex", "."], reporter)
+    if result.returncode > 1:
+        return None
+    try:
+        return int((result.stdout or "0").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def meta_path(database):
+    return database + ".meta"
+
+
+def read_meta(database):
+    """What is known about an index beyond its bytes.
+
+    For an index consulted while its disk sits in a drawer, the question
+    asked is never only 'does this path exist' but 'how old is this picture,
+    and which machine took it'. That answer has to be stored, because the
+    index itself cannot be asked.
+    """
+    try:
+        with open(meta_path(database)) as handle:
+            return json.load(handle)
+    except (IOError, ValueError):
+        return {}
+
+
+def write_meta(database, record):
+    try:
+        with open(meta_path(database), "wb") as handle:
+            handle.write((json.dumps(record, indent=2) + "\n").encode("utf-8"))
+    except IOError as exc:
+        # The index is the deliverable; losing its note is not worth failing
+        # a build that otherwise succeeded.
+        return str(exc)
+    return None
+
+
+def describe_age(database, meta):
+    built = meta.get("built")
+    days = ((time.time() - built) / 86400.0) if built else age_in_days(database)
+    if days is None:
+        return "age unknown", False
+    return "%d days old" % days, days > STALE_DAYS
+
+
+def emit(text, destination, reporter):
+    if destination in (None, "-"):
+        sys.stdout.write(text)
+        return
+    parent = os.path.dirname(os.path.abspath(destination))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    # Bytes, not text mode: a Windows interpreter writing text would turn
+    # every newline into CRLF, and the result would read wrong under Cygwin.
+    with open(destination, "wb") as handle:
+        handle.write(text.encode("utf-8"))
+    reporter.say(NORMAL, "wrote %s" % destination)
+
+
+def every_index(config, args, reporter):
+    """Each label that has an index on disk right now.
+
+    Searching all of them at once is the offline case: eight disks, six of
+    them in a drawer, and the question is which one holds the file.
+    """
+    held = []
+    for label in [l for l in config.labels() if l] or []:
+        try:
+            drive = Drive(label, Settings(args, config, label))
+        except Failure:
+            continue
+        if os.path.isfile(drive.database):
+            held.append(drive)
+    return held
+
+
+SHAPE_CHANGING = ("-c", "--count", "-0", "--null", "-S", "--statistics")
+
+
+def locate_passthrough(settings, extra):
+    """Options this program does not own, handed to locate untouched.
+
+    Wrapping a tool must not narrow it. Everything locate understands and
+    this program has no opinion about -- -r, -b, -w, -A, -p, the follow
+    flags -- goes straight through, and locate rejects what it does not
+    recognize, with its own message.
+    """
+    passed = list(extra)
+    if settings.args.regextype:
+        passed.append("--regextype=%s" % settings.args.regextype)
+    if settings.args.max_database_age:
+        passed.append("--max-database-age=%s" % settings.args.max_database_age)
+    elif not any(p.startswith("--max-database-age") for p in passed):
+        # locate warns about any index over eight days old, which for a disk
+        # indexed once and then unplugged is every search forever. Staleness
+        # is reported here instead, against a threshold that suits indexes
+        # kept for offline use, so locate's own warning is turned off rather
+        # than left to drown the real ones.
+        passed.append("--max-database-age=36500")
+    return passed
+
+
+def do_locate(drive, config, settings, reporter, patterns, extra=(),
+              members=None):
+    if not patterns:
+        raise UsageError("nothing to look for",
+                         ["%s-locate takes one or more patterns"
+                          % (drive.label if drive else "<label>")])
+
+    if members is not None:
+        drives = []
+        for label in members:
+            member = Drive(label, Settings(settings.args, config, label))
+            member.require_database()
+            drives.append(member)
+    elif settings.get("all", default=False, kind=as_bool):
+        drives = every_index(config, settings.args, reporter)
+        if not drives:
+            raise Failure("no index is held for any configured label",
+                          EX_NO_DATABASE,
+                          ["config files read: %s"
+                           % (", ".join(config.files()) or "none")])
+    else:
+        drive.require_database()
+        drives = [drive]
+
+    passed = locate_passthrough(settings, extra)
+    databases = ":".join(d.database for d in drives)
+    argv = ["locate", "-d", databases]
+    if settings.get("ignore-case", default=False, kind=as_bool):
+        argv.append("-i")
+    if settings.get("existing", default=False, kind=as_bool):
+        argv.append("-e")
+    limit = settings.get("limit", default=None, kind=int)
+    if limit:
+        argv.extend(["-l", str(limit)])
+    argv.extend(passed)
+    argv.append("--")
+    argv.extend(patterns)
+
+    result = run(argv, reporter)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    # locate exits 1 both for "nothing matched" and for a usage error such as
+    # a mistyped option, which would make a typo read as an empty result.
+    # Having complained while producing nothing is the discriminator: a real
+    # no-match is silent, and locate's one routine warning is turned off
+    # above. No need to read anyone's error text, which would not survive a
+    # different locale.
+    if result.returncode > 1 or (result.returncode == 1
+                                 and result.stderr and not result.stdout):
+        raise Failure("locate failed", EX_TOOL, [
+            "exit %d from: %s" % (result.returncode, " ".join(argv)),
+            "its own message is above",
+        ])
+
+    # -c, -0 and -S make locate emit something that is not one path per
+    # line. Counting those lines as hits would report a count as a filename,
+    # so the output goes through untouched and locate's own status stands.
+    if any(opt in passed for opt in SHAPE_CHANGING):
+        if settings.get("format", default=None) == "json":
+            raise UsageError("--json cannot describe this output", [
+                "%s changes what locate emits, so there are no paths to "
+                "wrap" % ", ".join(o for o in passed if o in SHAPE_CHANGING),
+            ])
+        emit(result.stdout or "", settings.get("output", default="-"),
+             reporter)
+        return EX_OK if result.returncode == 0 else EX_FAIL
+
+    hits = [line for line in (result.stdout or "").splitlines() if line]
+    return _report_hits(hits, drives, settings, reporter)
+
+
+def _report_hits(hits, drives, settings, reporter):
+    shape = settings.get("format", default=None)
+    if shape == "json":
+        body = json.dumps({"index": [d.database for d in drives],
+                           "count": len(hits),
+                           "match": hits}, indent=2) + "\n"
+    else:
+        body = "".join(line + "\n" for line in hits)
+    emit(body, settings.get("output", default="-"), reporter)
+
+    for drive in drives:
+        meta = read_meta(drive.database)
+        age, stale = describe_age(drive.database, meta)
+        note = "%s: %s" % (drive.label, age)
+        if meta.get("host") and meta["host"] != host_name():
+            note += ", built on %s" % meta["host"]
+        reporter.say(VERBOSE, note)
+        if stale:
+            reporter.say(NORMAL, "%s was indexed %s; it may not reflect the "
+                                 "disk any more" % (drive.label, age))
+
+    if not hits:
+        reporter.say(TERSE, "no match")
+        return EX_FAIL
+    reporter.say(VERBOSE, "%d match" % len(hits))
+    return EX_OK
+
+
+def do_updatedb(drive, settings, reporter):
+    if drive.imported:
+        raise Failure("%s is an imported index, not a built one" % drive.label,
+                      EX_USAGE, [
+                          "database: %s" % drive.database,
+                          "it has no root, which is what marks it as indexed "
+                          "elsewhere and copied here",
+                          "building it here would replace another machine's "
+                          "filesystem with a scan of a path that does not "
+                          "exist",
+                      ])
+
+    if not os.path.isdir(drive.root):
+        if drive.removable:
+            reporter.say(NORMAL, "%s is removable and is not mounted at %s; "
+                                 "leaving its index alone"
+                         % (drive.label, drive.root))
+            return EX_OK
+        where, contents = nearest_existing(drive.root)
+        detail = ["root: %s" % drive.root,
+                  "came from: %s" % settings.source.get("root", "default")]
+        if where:
+            detail.append("deepest existing ancestor: %s" % where)
+            detail.append("  holding: %s" % (", ".join(contents) or "<empty>"))
+        detail.append("mark it `removable = yes` if being absent is normal")
+        detail.extend(environment_facts())
+        raise Failure("%s has no root to scan" % drive.label, EX_FAIL, detail)
+
+    drive.check_volume()
+    check_no_whitespace([drive.root], "root",
+                        settings.source.get("root", "default"))
+    for path in drive.prune:
+        if not os.path.exists(path):
+            reporter.say(NORMAL, "prune path does not exist, so it prunes "
+                                 "nothing: %s" % path)
+    return _build(drive, settings, reporter)
+
+
+def _build(drive, settings, reporter):
+    """Build to a temporary output, check it, then rename it into place.
+
+    updatedb is wrapped, not replaced, so atomicity comes from giving it a
+    different --output and moving the result ourselves. A run that dies part
+    way leaves the temporary file and the previous index untouched, which is
+    the behaviour that matters: these indexes take an hour and often describe
+    a disk that is not attached to check against.
+    """
+    temporary = drive.database + ".new"
+    argv = ["updatedb", "--output=" + temporary,
+            "--localpaths=" + drive.root]
+    if drive.prune:
+        argv.append("--prunepaths=" + " ".join(drive.prune))
+
+    if settings.get("dry-run", default=False, kind=as_bool):
+        sys.stdout.write(" ".join(argv) + "\n")
+        sys.stdout.write("then rename %s to %s\n" % (temporary,
+                                                     drive.database))
+        reporter.say(NORMAL, "dry run; nothing was built")
+        return EX_OK
+
+    for directory in (os.path.dirname(drive.database),
+                      os.path.dirname(drive.log)):
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+
+    was = _previous(drive, reporter)
+    if os.path.exists(temporary):
+        reporter.say(VERBOSE, "discarding a leftover %s" % temporary)
+        os.remove(temporary)
+
+    reporter.say(NORMAL, "building %s from %s" % (drive.database, drive.root))
+    reporter.say(NORMAL, "diagnostics: %s" % drive.log)
+    started = time.time()
+    result = run(argv, reporter, stderr_to=drive.log)
+    elapsed = time.time() - started
+
+    if result.returncode != 0:
+        _discard(temporary)
+        raise Failure("updatedb failed; the existing index is untouched",
+                      EX_TOOL, [
+                          "exit %d from: %s" % (result.returncode,
+                                                " ".join(argv)),
+                          "its diagnostics are in %s" % drive.log,
+                          "%s still holds the previous index"
+                          % drive.database if was else
+                          "no previous index existed",
+                      ])
+    return _accept(drive, settings, reporter, temporary, was, elapsed)
+
+
+def _previous(drive, reporter):
+    """Size and entry count of the index about to be replaced, if any."""
+    if not os.path.isfile(drive.database):
+        return None
+    meta = read_meta(drive.database)
+    return {"size": os.path.getsize(drive.database),
+            "count": meta.get("count") or index_count(drive.database,
+                                                      reporter)}
+
+
+def _discard(temporary):
+    try:
+        os.remove(temporary)
+    except OSError:
+        pass
+
+
+def _accept(drive, settings, reporter, temporary, was, elapsed):
+    """Refuse a result that collapsed, unless told to take it anyway.
+
+    An index that went from 129 MB to nothing is never what was wanted, and
+    by the time anyone searches it the disk it described may be unreachable.
+    Refusing costs a rerun; accepting costs the only copy.
+    """
+    size = os.path.getsize(temporary) if os.path.exists(temporary) else 0
+    count = index_count(temporary, reporter)
+    forced = settings.get("force", default=False, kind=as_bool)
+
+    reasons = []
+    if size == 0:
+        reasons.append("the new index is empty")
+    if was and size < was["size"] * SHRINK_RATIO:
+        reasons.append("it is %d bytes where the old one was %d"
+                       % (size, was["size"]))
+    if was and was.get("count") and count is not None and \
+            count < was["count"] * SHRINK_RATIO:
+        reasons.append("it holds %d paths where the old one held %d"
+                       % (count, was["count"]))
+
+    if reasons and not forced:
+        _discard(temporary)
+        raise Failure("the build produced an index that looks wrong",
+                      EX_SUSPECT, reasons + [
+                          "it was discarded; %s is unchanged" % drive.database,
+                          "its diagnostics are in %s" % drive.log,
+                          "--force accepts the result anyway",
+                      ])
+    if reasons:
+        reporter.say(NORMAL, "accepting a suspect index because --force was "
+                             "given: %s" % "; ".join(reasons))
+
+    os.replace(temporary, drive.database)
+    complaint = write_meta(drive.database, {
+        "name": drive.label,
+        "host": host_name(),
+        "os": os_name(),
+        "root": drive.root,
+        "built": int(time.time()),
+        "count": count,
+        "tool": "%s %s" % (PROG, VERSION),
+    })
+    if complaint:
+        reporter.say(NORMAL, "the index is in place but its note was not "
+                             "written: %s" % complaint)
+    reporter.say(TERSE, "%s: %d bytes, %s paths, %d min %02d sec"
+                 % (drive.database, size,
+                    "unknown" if count is None else count,
+                    elapsed // 60, elapsed % 60))
+    return EX_OK
+
+
+def _place(source, destination, settings, reporter):
+    """Copy the program to where it runs from, atomically.
+
+    Built aside and moved, so a run interrupted mid-copy leaves the old
+    program or the new one and never half of either -- the same reasoning as
+    an index build, for the same reason: what is being replaced is in use.
+    """
+    if os.path.realpath(source) == os.path.realpath(destination):
+        reporter.say(VERBOSE, "already running from %s" % destination)
+        return
+    if os.path.isfile(destination) and filecmp.cmp(source, destination,
+                                                   shallow=False):
+        reporter.say(VERBOSE, "unchanged %s" % destination)
+        return
+    if settings.get("dry-run", default=False, kind=as_bool):
+        reporter.say(TERSE, "would place %s" % destination)
+        return
+    directory = os.path.dirname(destination)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    temporary = destination + ".new"
+    shutil.copyfile(source, temporary)
+    os.chmod(temporary, 0o755)
+    os.replace(temporary, destination)
+    reporter.say(TERSE, "placed %s" % destination)
+
+
+def do_install(config, settings, reporter, labels):
+    """Create the <label>-<action> symlinks, and place the program with them.
+
+    Idempotent by construction: a link already pointing where it should is
+    left alone and reported unchanged, so ten runs leave what one run left.
+
+    With --into, this is the deployment step. The repository is the source of
+    record and a copy is placed where it runs from, at a moment somebody
+    chose. Editing in one place and running from another without that moment
+    is what let a fix and its own test drift apart twice in one sitting.
+    """
+    program = os.path.realpath(os.path.abspath(sys.argv[0]))
+    into = settings.get("into", default=None)
+    if into:
+        directory = expand(into)
+        base = os.path.basename(program)
+        _place(program, os.path.join(directory, base), settings, reporter)
+    else:
+        directory, base = os.path.split(program)
+    labels = [l.lower() for l in labels] or (config.labels()
+                                             + config.group_names())
+    if not labels:
+        raise UsageError("no labels to install", [
+            "name them: %s install c d" % PROG,
+            "or give each one a [drive.<label>] section",
+            "config files read: %s" % (", ".join(config.files()) or "none"),
+        ])
+
+    dry = settings.get("dry-run", default=False, kind=as_bool)
+    force = settings.get("force", default=False, kind=as_bool)
+    changed = 0
+    for label in labels:
+        # A group gets the same pair as a label. It is an indirection, so
+        # both verbs make sense on it and neither needs a root of its own.
+        if label in config.group:
+            names, actions = [label], ACTIONS
+        else:
+            # Whether a label is imported is Drive's answer, not a guess from
+            # whether config spells a root out: a drive letter defaults to one
+            # and has no such key, and reading the key directly gave every
+            # configured drive a locate link and no updatedb.
+            drive = Drive(label, Settings(settings.args, config, label))
+            actions = ("locate",) if drive.imported else ACTIONS
+            # An alias reaches its entry only through a symlink of its own.
+            # Making the section's pair and not the aliases' left every alias
+            # usable just one way -- spelled out as an argument -- which is
+            # the way nobody uses and not what the alias was written for.
+            names = [label] + sorted(a for a, target in config.alias.items()
+                                     if target == label)
+        for name in names:
+            for action in actions:
+                link = os.path.join(directory, "%s-%s" % (name, action))
+                state = _link_state(link, base)
+                if state == "correct":
+                    reporter.say(VERBOSE, "unchanged %s" % link)
+                    continue
+                if state == "occupied" and not force:
+                    raise Failure(
+                        "%s is in the way and is not a symlink" % link,
+                        EX_FAIL,
+                        ["--force replaces it; nothing else will"])
+                if dry:
+                    reporter.say(TERSE, "would link %s -> %s" % (link, base))
+                    continue
+                if state != "missing":
+                    os.remove(link)
+                os.symlink(base, link)
+                reporter.say(TERSE, "linked %s -> %s" % (link, base))
+                changed += 1
+
+    reporter.say(NORMAL, "%d link changed" % changed)
+    return EX_OK
+
+
+def _link_state(link, base):
+    if os.path.islink(link):
+        return "correct" if os.readlink(link) == base else "stale"
+    if os.path.exists(link):
+        return "occupied"
+    return "missing"
+
+
+def _survey(config, args, labels):
+    """One record per label: is the root there, is the index, how old."""
+    rows = []
+    for label in labels:
+        settings = Settings(args, config, label)
+        try:
+            drive = Drive(label, settings)
+        except Failure as failure:
+            rows.append({"label": label, "error": failure.message})
+            continue
+        meta = read_meta(drive.database)
+        age, stale = describe_age(drive.database, meta)
+        held = os.path.isfile(drive.database)
+        rows.append({
+            "label": label,
+            "root": drive.root or "",
+            "root_present": bool(drive.root) and os.path.isdir(drive.root),
+            "removable": drive.removable,
+            "imported": drive.imported,
+            "database": drive.database,
+            "held": held,
+            "size": os.path.getsize(drive.database) if held else 0,
+            "count": meta.get("count"),
+            "built_on": meta.get("host"),
+            "age": age if held else "no index",
+            "stale": stale and held,
+        })
+    return rows
+
+
+def do_status(config, settings, reporter, words):
+    """What is here, what is missing, and what wants rebuilding.
+
+    With a dozen disks and most of them unplugged, this is the view that
+    answers the only real question: which indexes are worth trusting.
+    """
+    labels = [w.lower() for w in words] or config.labels()
+    if not labels:
+        raise UsageError("no labels to report on", [
+            "name them: %s status c d" % PROG,
+            "config files read: %s" % (", ".join(config.files()) or "none"),
+        ])
+    rows = _survey(config, settings.args, labels)
+
+    if settings.get("format", default=None) == "json":
+        emit(json.dumps(rows, indent=2) + "\n",
+             settings.get("output", default="-"), reporter)
+        return EX_OK
+
+    lines = ["%-12s %-7s %-7s %12s %10s  %s"
+             % ("label", "root", "index", "bytes", "paths", "age")]
+    for row in rows:
+        if "error" in row:
+            lines.append("%-12s %s" % (row["label"], row["error"]))
+            continue
+        root = "-" if not row["root"] else (
+            "yes" if row["root_present"] else
+            ("away" if row["removable"] else "GONE"))
+        if row["imported"]:
+            root = "import"
+        age = row["age"] + (" (stale)" if row["stale"] else "")
+        if row["built_on"] and row["built_on"] != host_name():
+            age += " on %s" % row["built_on"]
+        lines.append("%-12s %-7s %-7s %12s %10s  %s"
+                     % (row["label"], root, "yes" if row["held"] else "no",
+                        row["size"] or "-", row["count"] or "-", age))
+    emit("\n".join(lines) + "\n", settings.get("output", default="-"),
+         reporter)
+    return EX_OK
+
+
+def do_bulk(config, settings, reporter, words):
+    """Rebuild everything that should be rebuilt, and say what it skipped.
+
+    An entry marked `bulk = no` stays out: the registry trees change faster
+    than any index of them can stay true, so they are worth having on demand
+    and not worth sweeping. A removable disk that is not mounted is skipped
+    quietly, because absence is its normal state.
+    """
+    labels = [w.lower() for w in words] or config.labels()
+    if not labels:
+        raise UsageError("no labels to rebuild", [
+            "name them: %s bulk c d" % PROG,
+            "config files read: %s" % (", ".join(config.files()) or "none"),
+        ])
+
+    built, skipped, failed = [], [], []
+    for label in labels:
+        settings_for = Settings(settings.args, config, label)
+        try:
+            drive = Drive(label, settings_for)
+        except Failure as failure:
+            failed.append((label, failure.message))
+            continue
+        if drive.imported:
+            skipped.append((label, "imported"))
+            continue
+        if not drive.in_bulk:
+            skipped.append((label, "bulk = no"))
+            continue
+        if not os.path.isdir(drive.root):
+            skipped.append((label, "not mounted" if drive.removable
+                            else "root is gone: %s" % drive.root))
+            if not drive.removable:
+                failed.append((label, "root is gone: %s" % drive.root))
+            continue
+        reporter.say(TERSE, "--- %s" % label)
+        try:
+            do_updatedb(drive, settings_for, reporter)
+            built.append(label)
+        except Failure as failure:
+            reporter.error("%s: %s" % (label, failure.message))
+            reporter.detail(failure.detail)
+            failed.append((label, failure.message))
+
+    for label, why in skipped:
+        reporter.say(NORMAL, "skipped %s: %s" % (label, why))
+    reporter.say(TERSE, "%d built, %d skipped, %d failed"
+                 % (len(built), len(skipped), len(failed)))
+    # A sweep that lost one disk's index must not look like a success to
+    # whatever scheduled it.
+    return EX_FAIL if failed else EX_OK
+
+
+def do_config(config, settings, reporter, words):
+    """Show what was read and what it resolved to, with provenance."""
+    labels = [w.lower() for w in words] or config.labels()
+    report = {"file": config.files(), "alias": dict(config.alias),
+              "drive": {}}
+
+    for label in labels:
+        drive_settings = Settings(settings.args, config, label)
+        try:
+            drive = Drive(label, drive_settings)
+        except Failure as failure:
+            report["drive"][label] = {"error": failure.message}
+            continue
+        report["drive"][label] = {
+            "root": drive.root or "",
+            "database": drive.database,
+            "log": drive.log,
+            "prune": drive.prune,
+            "volume": drive.volume or "",
+            "removable": drive.removable,
+            "imported": drive.imported,
+            "bulk": drive.in_bulk,
+            "source": dict(drive_settings.source),
+        }
+
+    if settings.get("format", default=None) == "json":
+        emit(json.dumps(report, indent=2) + "\n",
+             settings.get("output", default="-"), reporter)
+        return EX_OK
+
+    lines = ["config files read:"]
+    lines.extend("  " + path for path in report["file"])
+    if not report["file"]:
+        lines.append("  none; every value below is a built-in default")
+    if config.alias:
+        lines.append("")
+        lines.append("aliases:")
+        for name in sorted(config.alias):
+            lines.append("  %-16s -> %s" % (name, config.alias[name]))
+
+    for label in labels:
+        entry = report["drive"][label]
+        lines.append("")
+        if "error" in entry:
+            lines.append("%s: %s" % (label, entry["error"]))
+            continue
+        lines.append(label)
+        for key in ("root", "database", "log"):
+            origin = entry["source"].get(
+                "db" if key == "database" else key, "default")
+            lines.append("  %-9s %s   [%s]"
+                         % (key, entry[key] or "<imported>", origin))
+        lines.append("  %-9s %s   [%s]"
+                     % ("prune", ", ".join(entry["prune"]) or "nothing",
+                        entry["source"].get("prune", "default")))
+        marks = [name for name, on in (("removable", entry["removable"]),
+                                       ("imported", entry["imported"]),
+                                       ("no bulk", not entry["bulk"]))
+                 if on]
+        if entry["volume"]:
+            marks.append("volume %s" % entry["volume"])
+        if marks:
+            lines.append("  %-9s %s" % ("flags", ", ".join(marks)))
+    emit("\n".join(lines) + "\n", settings.get("output", default="-"),
+         reporter)
+    return EX_OK
+
+
+def own_option_strings():
+    """Every option this program claims, asked of the parser itself.
+
+    Derived rather than listed, so a new option cannot be added without the
+    selector check learning about it on the same day.
+    """
+    spellings = set()
+    for action in build_parser()._actions:
+        spellings.update(action.option_strings)
+    return spellings
+
+
+def build_parser():
+    """argparse emulating the hand-written Usage block above.
+
+    The two are separate artifacts that nothing keeps in sync, so --help
+    prints the block verbatim rather than a generated summary: the text a
+    caller reads cannot then drift from the text that was reviewed. Bundling
+    (-qv) and attached short values (-l12) come free here and are the half a
+    hand-rolled parser always drops.
+    """
+    p = argparse.ArgumentParser(prog=PROG, add_help=False,
+                                usage=argparse.SUPPRESS)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("-V", "--version", action="store_true")
+
+    p.add_argument("-v", "--verbose", action="count", default=None)
+    p.add_argument("--no-verbose", action="store_const", const=0,
+                   dest="verbose")
+    for short, name in (("-t", "terse"), ("-q", "quiet"), ("-d", "debug")):
+        p.add_argument(short, "--" + name, action="store_true", default=None)
+        p.add_argument("--no-" + name, action="store_false", dest=name)
+
+    shape = p.add_mutually_exclusive_group()
+    shape.add_argument("--json", action="store_const", const="json",
+                       dest="format", default=None)
+    shape.add_argument("--porcelain", action="store_const", const="porcelain",
+                       dest="format")
+
+    p.add_argument("--color", choices=("auto", "always", "never"), default=None)
+    p.add_argument("--no-color", action="store_const", const="never",
+                   dest="color")
+    p.add_argument("-o", "--output", default=None)
+    p.add_argument("--config", default=None)
+    p.add_argument("--into", default=None)
+
+    p.add_argument("-n", "--dry-run", action="store_true", default=None)
+    p.add_argument("--no-dry-run", action="store_false", dest="dry_run")
+    p.add_argument("-f", "--force", action="store_true", default=None)
+    p.add_argument("--no-force", action="store_false", dest="force")
+    p.add_argument("-a", "--all-indexes", action="store_true", default=None,
+                   dest="all")
+    # Owned rather than passed through only because they take a value, and an
+    # unrecognized option's value would be captured as a search pattern.
+    p.add_argument("--regextype", default=None)
+    p.add_argument("--max-database-age", default=None)
+
+    p.add_argument("--root", default=None)
+    p.add_argument("--db", default=None)
+    p.add_argument("--prune", action="append", default=None)
+    p.add_argument("--no-prune", action="store_true", default=False)
+    p.add_argument("--log", default=None)
+
+    p.add_argument("-e", "--existing", action="store_true", default=None)
+    p.add_argument("--no-existing", action="store_false", dest="existing")
+    p.add_argument("-i", "--ignore-case", action="store_true", default=None)
+    p.add_argument("--no-ignore-case", action="store_false", dest="ignore_case")
+    p.add_argument("-l", "--limit", type=int, default=None)
+
+    p.add_argument("words", nargs="*")
+    return p
+
+
+def dispatch_from_name(argv0, words):
+    """Work out the label and the action, from the name or from the words.
+
+    The name is tried first, so a symlink always wins; that is the whole
+    point. Split at the last dash, so c-all-locate names the label c-all.
+    """
+    name = os.path.basename(argv0)
+    label, dash, action = name.rpartition("-")
+    if dash and label and action in ACTIONS:
+        return label, action, words
+
+    if not words:
+        raise UsageError("no action given", [
+            "invoked as: %s" % name,
+            "that name is not of the form <label>-<action>, so the label "
+            "and the action have to be arguments",
+            "try: %s c locate PATTERN, or %s --help" % (PROG, PROG),
+        ])
+
+    head = words[0]
+    # A label may share a name with an admin verb -- `install` is a plausible
+    # name for a tree and is one in use. The second word decides: followed by
+    # an action it is a label, otherwise it is the verb. Nothing is ambiguous
+    # because the admin verbs take labels, never actions.
+    if len(words) >= 2 and words[1] in ACTIONS:
+        return head, words[1], words[2:]
+    if head in ADMIN:
+        return None, head, words[1:]
+    if len(words) == 1:
+        raise UsageError("label %r given with no action" % head,
+                         ["actions: %s" % ", ".join(ACTIONS + ADMIN)])
+    raise UsageError("unknown action %r" % words[1],
+                     ["actions: %s" % ", ".join(ACTIONS + ADMIN)])
+
+
+def load_config(args, reporter):
+    explicit = args.config or os.environ.get("DRIVE_INDEX_CONFIG")
+    if not explicit:
+        return Config.load(config_candidates(), reporter)
+
+    # Stated at normal verbosity, not behind --verbose: this discards every
+    # other layer, and a stray value in an environment is exactly how that
+    # happens without anyone noticing.
+    reporter.say(NORMAL, "config: %s replaces the merge stack" % explicit)
+    if not os.path.isfile(explicit):
+        where, contents = nearest_existing(explicit)
+        detail = ["came from: %s" % ("--config" if args.config
+                                     else "environment DRIVE_INDEX_CONFIG")]
+        if where:
+            detail.append("deepest existing ancestor: %s" % where)
+            detail.append("  holding: %s" % (", ".join(contents) or "<empty>"))
+        detail.extend(environment_facts())
+        raise Failure("no such config file: %s" % explicit, EX_USAGE, detail)
+    return Config.load([explicit], reporter)
+
+
+def main(argv):
+    args, extra = build_parser().parse_known_args(argv[1:])
+
+    # argparse matches positionals in one contiguous run, so everything after
+    # the first unrecognized option lands in the leftovers -- patterns
+    # included. Reached through a symlink there are no leading positionals
+    # and it never shows; reached as `drive-index area locate --prod X` the
+    # pattern vanishes and the run reports having nothing to look for.
+    # The two options of locate's that take a separate value are owned here,
+    # so a leftover that is not an option is a word rather than somebody's
+    # argument.
+    stray = [word for word in extra if not word.startswith("-")]
+    if stray:
+        args.words = args.words + stray
+        extra = [word for word in extra if word.startswith("-")]
+
+    if args.help:
+        sys.stdout.write(USAGE)
+        return EX_OK
+    if args.version:
+        sys.stdout.write("%s %s\n" % (PROG, VERSION))
+        return EX_OK
+
+    colour = args.color or os.environ.get("DRIVE_INDEX_COLOR") or "auto"
+    reporter = Reporter(color=colour)
+    label, action, rest = dispatch_from_name(argv[0], args.words)
+
+    config = load_config(args, reporter)
+    label = config.resolve(label)
+    reporter.level = volume_from(
+        _flags(lambda n: getattr(args, n, None)),
+        _flags(lambda n: os.environ.get("DRIVE_INDEX_" + n.upper())),
+        _flags(lambda n: config.lookup(label, n)[0]))
+
+    settings = Settings(args, config, label)
+    group = config.group.get(label)
+    if group and action in ACTIONS:
+        chosen, extra = group.choose(extra)
+        if not chosen:
+            raise UsageError("no member of %s was selected" % label, [
+                "selectors: %s" % " ".join("--" + s
+                                           for s in group.selectors()),
+            ])
+        # Narrowing is what misleads, so it is announced; widening to every
+        # member is the default and needs no sentence. On stderr, where it
+        # stays out of piped output but survives into a pasted transcript.
+        if len(chosen) < len(group.members):
+            reporter.say(NORMAL, "%s: %s" % (label, " ".join(chosen)))
+        if action == "locate":
+            return do_locate(None, config, settings, reporter, rest, extra,
+                             members=chosen)
+        reporter.say(TERSE, "%s: building %s" % (label, " ".join(chosen)))
+        return do_bulk(config, settings, reporter, chosen)
+
+    # Options this program does not recognize belong to locate, and are its
+    # to reject. Anywhere else there is nothing to hand them to, so an
+    # unknown option is what it looks like: a mistake.
+    if extra and action != "locate":
+        raise UsageError("unrecognized arguments: %s" % " ".join(extra), [
+            "options are passed through to locate, and %s does not run it"
+            % action,
+        ])
+
+    if action == "install":
+        return do_install(config, settings, reporter, rest)
+    if action == "config":
+        return do_config(config, settings, reporter, rest)
+    if action == "status":
+        return do_status(config, settings, reporter, rest)
+    if action == "bulk":
+        return do_bulk(config, settings, reporter, rest)
+
+    drive = Drive(label, settings)
+    if action == "locate":
+        return do_locate(drive, config, settings, reporter, rest, extra)
+    if rest:
+        raise UsageError("%s-updatedb takes no arguments" % label,
+                         ["got: %s" % " ".join(rest)])
+    return do_updatedb(drive, settings, reporter)
+
+
+if __name__ == "__main__":
+    reporter = Reporter()
+    try:
+        sys.exit(main(sys.argv))
+    except Failure as failure:
+        reporter.error(failure.message)
+        reporter.detail(failure.detail)
+        sys.exit(failure.code)
+    except KeyboardInterrupt:
+        reporter.error("interrupted")
+        sys.exit(EX_FAIL)

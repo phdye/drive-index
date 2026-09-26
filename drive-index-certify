@@ -1,0 +1,614 @@
+#!/usr/bin/env bash
+# Certification bar for drive-index. Every check states its expected exit
+# code and compares against it; nothing here builds a real index.
+#
+# Usage: drive-index-certify [PYTHON]
+#   PYTHON defaults to the python3 on PATH. Pass the RHEL one to certify the
+#   3.6 floor: drive-index-certify /opt/rhel/bin/python3
+
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "$0")" && pwd)
+prog="${here}/drive-index"
+python=${1:-python3}
+pass=0
+fail=0
+
+# Symlinks are made in a sandbox rather than beside the program. A bar that
+# installs into its own directory leaves artifacts in the working tree and
+# only passes where a deployment already exists; this one runs anywhere.
+bin=$(mktemp -d)
+trap 'rm -rf "$bin"' EXIT
+cp "$prog" "${bin}/drive-index"
+chmod 755 "${bin}/drive-index"
+sandbox="${bin}/drive-index"
+"$python" "$sandbox" install >/dev/null 2>&1
+
+check () {          # check <label> <expected-rc> <command...>
+    local label=$1 want=$2; shift 2
+    local out rc
+    out=$("$@" 2>&1); rc=$?
+    if [ "$rc" = "$want" ]; then
+        printf 'PASS  %-46s rc=%s\n' "$label" "$rc"
+        pass=$((pass + 1))
+    else
+        printf 'FAIL  %-46s rc=%s want=%s\n' "$label" "$rc" "$want"
+        printf '      %s\n' "${out%%$'\n'*}"
+        fail=$((fail + 1))
+    fi
+}
+
+contains () {       # contains <label> <needle> <command...>
+    local label=$1 needle=$2; shift 2
+    local out
+    # Captured, then matched without a pipeline. Under pipefail a
+    # `cmd | grep` reports cmd's status, not grep's, so every check against a
+    # command that exits non-zero would fail whatever the output said.
+    out=$("$@" 2>&1)
+    case $out in
+        *"$needle"*)
+            printf 'PASS  %-46s\n' "$label"
+            pass=$((pass + 1)) ;;
+        *)
+            printf 'FAIL  %-46s (no %q in output)\n' "$label" "$needle"
+            fail=$((fail + 1)) ;;
+    esac
+}
+
+echo "certifying ${prog}"
+echo "interpreter: $("$python" -V 2>&1)"
+echo
+
+# B1 -- the syntax floor. Everything else is moot if this fails.
+check "B1  compiles"                        0 "$python" -m py_compile "$prog"
+
+# B2, B3 -- the two options every tool here carries.
+check "B2  --help exits 0"                  0 "$python" "$prog" --help
+contains "B2  --help prints the Usage block"  "Usage:" "$python" "$prog" --help
+check "B3  -V exits 0"                      0 "$python" "$prog" -V
+
+# B4, B5 -- usage errors are 2, and they say something useful.
+check "B4  unknown option is a usage error" 2 "$python" "$prog" --no-such-option
+check "B5  no action is a usage error"      2 "$python" "$prog"
+contains "B5  and names both ways in"      "<label>-<action>" \
+         "$python" "$prog"
+check "B5  drive with no action"            2 "$python" "$prog" c
+check "B5  unknown action"                  2 "$python" "$prog" c frobnicate
+
+# B6 -- the everyday path, through the symlink and under the program's name.
+check "B6  c-locate finds something"        0 "${bin}/c-locate" bash
+check "B6  no match exits 1"                1 "${bin}/c-locate" \
+      zzq-nothing-is-named-this-zzq
+check "B6  same under the program name"     0 "$python" "$prog" c locate bash
+
+# B7 -- the defect the old script carried: a clean run must not exit non-zero.
+check "B7  updatedb --dry-run exits 0"      0 "${bin}/c-updatedb" --dry-run
+contains "B7  and shows the command"          "updatedb --output=" \
+         "${bin}/c-updatedb" -n
+
+# B7b -- the defect itself. A dry run proves the pipeline is gone; only a real
+# build that succeeds proves a successful build no longer exits non-zero. Over
+# this directory rather than a whole drive, so it takes a second.
+tmp=$(mktemp -d)
+check "B7  real build exits 0"              0 "$python" "$prog" \
+      --root "$here" --db "${tmp}/t.db" --log "${tmp}/t.log" --no-prune \
+      t updatedb
+check "B7  and what it built is searchable" 0 "$python" "$prog" \
+      --db "${tmp}/t.db" t locate drive-index
+rm -rf "$tmp"
+
+# B8 -- idempotency: the second run changes nothing.
+check "B8  install is repeatable"           0 "$python" "$sandbox" install c
+contains "B8  second run reports no change"   "0 link changed" \
+         "$python" "$sandbox" -v install c
+
+# B9 -- a missing database is its own exit code, and the message says where
+# the bad value came from rather than leaving the reader to guess.
+check "B9  missing database exits 3"        3 "$python" "$prog" \
+      --db /nowhere/at/all.db c locate bash
+contains "B9  names the provenance"           "came from: option" \
+         "$python" "$prog" --db /nowhere/at/all.db c locate bash
+contains "B9  names the nearest real path"    "deepest existing ancestor" \
+         "$python" "$prog" --db /nowhere/at/all.db c locate bash
+
+# B10 -- precedence: the option outranks the environment variable.
+DRIVE_INDEX_DB=/nowhere/from/env.db \
+    contains "B10 option beats environment" "at/all.db" \
+    "$python" "$prog" --db /nowhere/at/all.db c locate bash
+DRIVE_INDEX_DB=/nowhere/from/env.db \
+    contains "B10 environment is used when alone" "environment DRIVE_INDEX_DB" \
+    "$python" "$prog" c locate bash
+
+# B11 -- CRLF would break the shebang line under Cygwin, silently.
+if grep -qU $'\r' "$prog"; then
+    printf 'FAIL  %-46s\n' "B11 no CRLF in the program"; fail=$((fail + 1))
+else
+    printf 'PASS  %-46s\n' "B11 no CRLF in the program"; pass=$((pass + 1))
+fi
+
+# B12 -- the short-option forms a hand-rolled parser always drops.
+check "B12 bundled flags (-qv)"             0 "${bin}/c-locate" -qv bash
+check "B12 attached short value (-l2)"      0 "${bin}/c-locate" -l2 bash
+check "B12 separated short value (-l 2)"    0 "${bin}/c-locate" -l 2 bash
+
+# Guards on the two format flags and on the whitespace prune path.
+check "two format flags is a usage error"   2 "${bin}/c-locate" \
+      --json --porcelain bash
+check "whitespace prune path is refused"    2 "${bin}/c-updatedb" \
+      --prune '/c/System Volume Information'
+
+# B13 -- the label is a label, not a letter, and an imported index has no
+# build side. Exit 1 here means locate ran and matched nothing, which is what
+# proves the dispatch found 4tb's database; exit 3 would mean it did not.
+check "B13 digit-led label dispatches"      1 "${bin}/4tb-locate" \
+      zzq-nothing-is-named-this-zzq
+check "B13 imported index refuses a build"  2 "$python" "$prog" 4tb updatedb
+contains "B13 and says why"                   "imported index" \
+         "$python" "$prog" 4tb updatedb
+if [ -e "${bin}/4tb-updatedb" ]; then
+    printf 'FAIL  %-46s\n' "B13 no updatedb link for an import"
+    fail=$((fail + 1))
+else
+    printf 'PASS  %-46s\n' "B13 no updatedb link for an import"
+    pass=$((pass + 1))
+fi
+
+# B14 -- a drive letter needs no configuration at all; anything else does,
+# and says which section is missing rather than inventing a root.
+empty=$(mktemp)
+check "B14 drive works with no config"      0 "$python" "$prog" \
+      --config "$empty" c locate bash
+check "B14 non-drive with no config is 2"   2 "$python" "$prog" \
+      --config "$empty" 4tb locate bash
+contains "B14 and names the section wanted"   "[drive.4tb]" \
+         "$python" "$prog" --config "$empty" 4tb locate bash
+rm -f "$empty"
+
+#-----------------------------------------------------------------------------
+# Version 2: atomicity, volume identity, aliases, removable, bulk, metadata.
+#-----------------------------------------------------------------------------
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+mkdir -p "${work}/full" "${work}/empty"
+for i in 1 2 3 4 5 6 7 8 9 10; do : > "${work}/full/file-${i}"; done
+
+# B15 -- the whole point of building to a temporary path. Build a real index,
+# then build again over an empty root: the result collapses, so it must be
+# refused and the good index left exactly as it was.
+check "B15 first build succeeds"            0 "$python" "$prog" \
+      --root "${work}/full" --db "${work}/t.db" --log "${work}/t.log" \
+      --no-prune t updatedb
+before=$(wc -c < "${work}/t.db")
+check "B15 a collapsed rebuild is refused"  6 "$python" "$prog" \
+      --root "${work}/empty" --db "${work}/t.db" --log "${work}/t.log" \
+      --no-prune t updatedb
+after=$(wc -c < "${work}/t.db")
+if [ "$before" = "$after" ]; then
+    printf 'PASS  %-46s\n' "B15 and the old index is untouched"
+    pass=$((pass + 1))
+else
+    printf 'FAIL  %-46s (%s -> %s bytes)\n' \
+        "B15 and the old index is untouched" "$before" "$after"
+    fail=$((fail + 1))
+fi
+if [ -e "${work}/t.db.new" ]; then
+    printf 'FAIL  %-46s\n' "B15 no temporary left behind"; fail=$((fail + 1))
+else
+    printf 'PASS  %-46s\n' "B15 no temporary left behind"; pass=$((pass + 1))
+fi
+check "B15 --force accepts it anyway"       0 "$python" "$prog" --force \
+      --root "${work}/empty" --db "${work}/t.db" --log "${work}/t.log" \
+      --no-prune t updatedb
+
+# B16 -- the index carries a note saying when and where it was made.
+check "B16 rebuild for metadata"            0 "$python" "$prog" \
+      --root "${work}/full" --db "${work}/m.db" --log "${work}/t.log" \
+      --no-prune t updatedb
+contains "B16 metadata names this host"       "\"host\"" cat "${work}/m.db.meta"
+contains "B16 metadata records the root"      "${work}/full" \
+         cat "${work}/m.db.meta"
+
+# B17 -- volume identity. The marker says which disk this is; a build against
+# a root holding the wrong one must refuse rather than relabel an index.
+mkdir -p "${work}/vol"
+printf 'usb-red\n' > "${work}/vol/.volume-id"
+cat > "${work}/vol.ini" <<INI
+[drive.red]
+root = ${work}/vol
+database = ${work}/red.db
+volume = usb-red
+[drive.blue]
+root = ${work}/vol
+database = ${work}/blue.db
+volume = usb-blue
+INI
+check "B17 right volume builds"             0 "$python" "$prog" \
+      --config "${work}/vol.ini" --log "${work}/t.log" red updatedb
+check "B17 wrong volume is refused"         5 "$python" "$prog" \
+      --config "${work}/vol.ini" --log "${work}/t.log" blue updatedb
+contains "B17 and names both sides"           "found:" "$python" "$prog" \
+         --config "${work}/vol.ini" --log "${work}/t.log" blue updatedb
+if [ -e "${work}/blue.db" ]; then
+    printf 'FAIL  %-46s\n' "B17 wrong volume wrote nothing"; fail=$((fail + 1))
+else
+    printf 'PASS  %-46s\n' "B17 wrong volume wrote nothing"; pass=$((pass + 1))
+fi
+
+# B18 -- removable roots. Absent is normal for them, so a build is a quiet
+# no-op rather than a failure, and a bulk sweep passes over them.
+cat > "${work}/rm.ini" <<INI
+[drive.away]
+root = ${work}/not-mounted
+database = ${work}/away.db
+removable = yes
+[drive.fixed]
+root = ${work}/not-mounted
+database = ${work}/fixed.db
+INI
+check "B18 absent removable root is fine"   0 "$python" "$prog" \
+      --config "${work}/rm.ini" away updatedb
+check "B18 absent fixed root is not"        1 "$python" "$prog" \
+      --config "${work}/rm.ini" fixed updatedb
+contains "B18 and suggests the flag"          "removable = yes" \
+         "$python" "$prog" --config "${work}/rm.ini" fixed updatedb
+
+# B19 -- the namespace guarantee. A one-letter alias would shadow a drive and
+# two entries claiming one alias would make the result depend on file order.
+# Both are refused when the file is read, not when someone relies on them.
+cat > "${work}/bad-letter.ini" <<INI
+[drive.c-all]
+root = /c
+alias = q
+INI
+check "B19 single-letter alias refused"     2 "$python" "$prog" \
+      --config "${work}/bad-letter.ini" status
+contains "B19 and says letters are reserved"  "reserved to drives" \
+         "$python" "$prog" --config "${work}/bad-letter.ini" status
+cat > "${work}/dup.ini" <<INI
+[drive.one]
+root = /c
+alias = shared
+[drive.two]
+root = /c
+alias = shared
+INI
+check "B19 duplicate alias refused"         2 "$python" "$prog" \
+      --config "${work}/dup.ini" status
+
+# B20 -- an alias reaches its entry. Against a fixture rather than whatever
+# config this machine happens to carry: a check that reads the operator's own
+# configuration passes or fails for reasons that have nothing to do with the
+# code.
+cat > "${work}/alias.ini" <<INI
+[drive.imported]
+alias = old-backup
+database = ${work}/m.db
+INI
+check "B20 alias resolves to its label"     1 "$python" "$prog" \
+      --config "${work}/alias.ini" old-backup locate zzq-nothing-is-named-zzq
+contains "B20 and config shows the mapping"   "old-backup" \
+         "$python" "$prog" --config "${work}/alias.ini" config
+
+# B21 -- searching every index at once, which is the offline case. The proof
+# is the colon-joined database list, not merely that the run succeeded.
+contains "B21 --all joins the indexes held"   ".db:" \
+         "$python" "$prog" -a --debug c locate zzq-nothing-is-named-this-zzq
+
+# B22 -- a bulk sweep leaves out what should not be swept.
+contains "B22 bulk skips bulk = no"           "skipped registry" \
+         "$python" "$prog" -v bulk registry
+contains "B22 bulk skips an import"           "skipped 4tb" \
+         "$python" "$prog" -v bulk 4tb
+
+# B23 -- status reports machine-readably too.
+check "B23 status --json"                   0 "$python" "$prog" \
+      --json status c
+contains "B23 and marks the import"           "\"imported\": true" \
+         "$python" "$prog" --json status 4tb
+
+# B24 -- a wrapper must not narrow the tool it wraps. Every locate option
+# this program has no opinion about goes straight through.
+check "B24 -r reaches locate"               0 "${bin}/c-locate" \
+      -r 'dri.e-inde.'
+check "B24 -b reaches locate"               0 "${bin}/c-locate" \
+      -b drive-index
+check "B24 -A reaches locate"               0 "${bin}/c-locate" \
+      -A drive index
+check "B24 -r with no match still exits 1"  1 "${bin}/c-locate" \
+      -r 'zzq.*nothing.*zzq'
+contains "B24 --regextype takes its value"    "--regextype=posix-egrep" \
+         "${bin}/c-locate" --debug --regextype posix-egrep -r 'dri.e-inde.'
+
+# -c changes what locate emits, so the count must pass through rather than
+# being read back as though it were a path.
+out=$("${bin}/c-locate" -c drive-index 2>/dev/null)
+case $out in
+    ''|*[!0-9]*)
+        printf 'FAIL  %-46s (%q)\n' "B24 -c yields a bare count" "$out"
+        fail=$((fail + 1)) ;;
+    *)
+        printf 'PASS  %-46s\n' "B24 -c yields a bare count"
+        pass=$((pass + 1)) ;;
+esac
+check "B24 -c with --json is refused"       2 "${bin}/c-locate" \
+      --json -c drive-index
+
+# locate rejects what it does not know, in its own words rather than ours.
+check "B24 a bogus option still fails"      4 "${bin}/c-locate" \
+      --no-such-locate-option drive-index
+# An action that never runs locate has nothing to hand them to.
+check "B24 updatedb rejects passthrough"    2 "${bin}/c-updatedb" -r foo
+check "B24 status rejects passthrough"      2 "$python" "$prog" -r foo status
+
+# A stale index must not make a search look like a failure. This is the
+# regression for the discriminator above: 4tb is well past locate's own
+# eight-day warning threshold, and searching it is still a search.
+check "B24 stale index still searches"      1 "${bin}/4tb-locate" \
+      zzq-nothing-is-named-this-zzq
+check "B24 stale index with a hit"          0 "${bin}/4tb-locate" -l 1 e
+
+# B25 -- a label may share a name with an admin verb, and aliases need
+# symlinks of their own or they are only reachable the way nobody uses.
+cat > "${work}/area.ini" <<INI
+[drive.install]
+root = ${work}/full
+database = ${work}/install.db
+[drive.z]
+alias = app-prod
+database = ${work}/m.db
+INI
+check "B25 install as a label, not the verb"  0 "$python" "$prog" \
+      --config "${work}/area.ini" --db "${work}/m.db" install locate file-1
+check "B25 install is still the verb alone"   0 "$python" "$prog" \
+      --config "${work}/area.ini" -n install
+check "B25 install still takes labels"        0 "$python" "$prog" \
+      --config "${work}/area.ini" -n install z
+
+area=$(mktemp -d)
+cp "$prog" "${area}/drive-index" && chmod 755 "${area}/drive-index"
+"$python" "${area}/drive-index" --config "${work}/area.ini" \
+    install >/dev/null 2>&1
+for want in z-locate z-updatedb app-prod-locate app-prod-updatedb \
+            install-locate install-updatedb; do
+    if [ -L "${area}/${want}" ]; then
+        printf 'PASS  %-46s\n' "B25 ${want} linked"; pass=$((pass + 1))
+    else
+        printf 'FAIL  %-46s\n' "B25 ${want} linked"; fail=$((fail + 1))
+    fi
+done
+check "B25 an alias symlink dispatches"     1 env \
+      DRIVE_INDEX_CONFIG="${work}/area.ini" \
+      "${area}/app-prod-locate" zzq-nothing-is-named-this-zzq
+# The guard on an unknown non-drive label must survive db_file_model being
+# set, which gives every value a config provenance and defeated it once.
+cat > "${work}/model.ini" <<INI
+[defaults]
+db_file_model = ${work}/{name}.db
+INI
+check "B25 unknown label is refused"        2 "$python" "$prog" \
+      --config "${work}/model.ini" nosuchlabel locate anything
+check "B25 --db alone is enough"            1 "$python" "$prog" \
+      --config "${work}/model.ini" --db "${work}/m.db" oneoff locate zzq-no
+rm -rf "$area"
+
+
+#-----------------------------------------------------------------------------
+# B26 -- groups: one prefix over several labels, narrowed by a selector.
+#-----------------------------------------------------------------------------
+
+mkdir -p "${work}/g1" "${work}/g2" "${work}/g3"
+: > "${work}/g1/alpha-one" ; : > "${work}/g2/beta-two" ; : > "${work}/g3/gamma-three"
+cat > "${work}/grp.ini" <<INI
+[drive.ga]
+root = ${work}/g1
+database = ${work}/ga.db
+[drive.gb]
+root = ${work}/g2
+database = ${work}/gb.db
+[drive.gc]
+root = ${work}/g3
+database = ${work}/gc.db
+[group.area]
+default = all
+member.one   = ga
+member.two   = gb
+member.three = gc
+INI
+G=( "$python" "$prog" --config "${work}/grp.ini" --log "${work}/t.log" )
+
+check "B26 a group builds every member"     0 "${G[@]}" area updatedb
+for db in ga gb gc; do
+    if [ -s "${work}/${db}.db" ]; then
+        printf 'PASS  %-46s\n' "B26 ${db} was built"; pass=$((pass + 1))
+    else
+        printf 'FAIL  %-46s\n' "B26 ${db} was built"; fail=$((fail + 1))
+    fi
+done
+
+# Searching: all members by default, a selector narrows, selectors union.
+check "B26 a group search finds any member" 0 "${G[@]}" area locate gamma-three
+check "B26 a selector narrows"              1 "${G[@]}" area locate \
+      --three beta-two
+check "B26 the selected member still hits"  0 "${G[@]}" area locate \
+      --three gamma-three
+contains "B26 two selectors union"            "beta-two" \
+         "${G[@]}" area locate --one --two beta-two
+contains "B26 narrowing is announced"         "area: gc" \
+         "${G[@]}" area locate --three gamma-three
+# Widening is the safe default and says nothing; the announcement would be
+# noise on every ordinary search.
+out=$("${G[@]}" area locate gamma-three 2>&1 >/dev/null)
+case $out in
+    *"area: "*) printf 'FAIL  %-46s\n' "B26 all members is silent"
+                fail=$((fail + 1)) ;;
+    *)          printf 'PASS  %-46s\n' "B26 all members is silent"
+                pass=$((pass + 1)) ;;
+esac
+
+# default may name a subset rather than all.
+sed 's/^default = all/default = two/' "${work}/grp.ini" > "${work}/grpd.ini"
+check "B26 a default subset applies"        1 "$python" "$prog" \
+      --config "${work}/grpd.ini" area locate gamma-three
+check "B26 and a selector overrides it"     0 "$python" "$prog" \
+      --config "${work}/grpd.ini" area locate --three gamma-three
+
+# Validation, which is the half that earns its keep. Each of these is caught
+# when the file is read, not when somebody relies on it.
+refuse () {         # refuse <label> <needle> <config-body>
+    local label=$1 needle=$2 body=$3
+    printf '%s\n' "$body" > "${work}/bad.ini"
+    check "B26 ${label}" 2 "$python" "$prog" --config "${work}/bad.ini" status
+    contains "B26 ${label}, and says why" "$needle" \
+             "$python" "$prog" --config "${work}/bad.ini" status
+}
+
+refuse "a selector of ours is refused" "option of this program" \
+"[drive.ga]
+root = ${work}/g1
+[group.area]
+member.json = ga"
+
+refuse "a selector of locate's is refused" "option of locate" \
+"[drive.ga]
+root = ${work}/g1
+[group.area]
+member.basename = ga"
+
+refuse "a nested group is refused" "do not nest" \
+"[drive.ga]
+root = ${work}/g1
+[group.inner]
+member.one = ga
+[group.outer]
+member.two = inner"
+
+refuse "a member that is no label is refused" "is not a label" \
+"[group.area]
+member.one = nosuchthing"
+
+refuse "a member named twice is refused" "twice" \
+"[drive.ga]
+root = ${work}/g1
+[group.area]
+member.one = ga
+member.uno = ga"
+
+refuse "a single-letter group is refused" "reserved to drives" \
+"[drive.ga]
+root = ${work}/g1
+[group.q]
+member.one = ga"
+
+refuse "a group that is also a label is refused" "both a group and a label" \
+"[drive.area]
+root = ${work}/g1
+[group.area]
+member.one = area"
+
+refuse "a group with no members is refused" "names no members" \
+"[group.area]
+default = all"
+
+# A group gets symlinks like a label, and dispatches through them.
+garea=$(mktemp -d)
+cp "$prog" "${garea}/drive-index" && chmod 755 "${garea}/drive-index"
+"$python" "${garea}/drive-index" --config "${work}/grp.ini" \
+    install >/dev/null 2>&1
+for want in area-locate area-updatedb ga-locate ga-updatedb; do
+    if [ -L "${garea}/${want}" ]; then
+        printf 'PASS  %-46s\n' "B26 ${want} linked"; pass=$((pass + 1))
+    else
+        printf 'FAIL  %-46s\n' "B26 ${want} linked"; fail=$((fail + 1))
+    fi
+done
+check "B26 a group symlink dispatches"      0 env \
+      DRIVE_INDEX_CONFIG="${work}/grp.ini" \
+      "${garea}/area-locate" beta-two
+check "B26 and carries its selector"        1 env \
+      DRIVE_INDEX_CONFIG="${work}/grp.ini" \
+      "${garea}/area-locate" --one beta-two
+rm -rf "$garea"
+
+# A sweep that lost a member must not report success, and a selector that
+# matches nothing is a usage error rather than a silent empty run.
+check "B26 a failed member fails the sweep" 1 "$python" "$prog" \
+      --config "${work}/grp.ini" --root "${work}/gone" --log "${work}/t.log" \
+      area updatedb
+# locate's own options still reach locate through a group.
+check "B26 -r still reaches locate"         0 "${G[@]}" area locate \
+      -r 'gamma-thre.'
+
+
+#-----------------------------------------------------------------------------
+# B27 -- deployment. The repository is the source; --into places a copy where
+# it runs from, at a moment somebody chose.
+#-----------------------------------------------------------------------------
+
+dest=$(mktemp -d)
+rm -rf "$dest"                       # must create its own destination
+check "B27 --into places the program"       0 "$python" "$prog" \
+      --config "${work}/grp.ini" --into "$dest" install
+if [ -f "${dest}/drive-index" ] && [ -x "${dest}/drive-index" ]; then
+    printf 'PASS  %-46s\n' "B27 and it is executable"; pass=$((pass + 1))
+else
+    printf 'FAIL  %-46s\n' "B27 and it is executable"; fail=$((fail + 1))
+fi
+if cmp -s "$prog" "${dest}/drive-index"; then
+    printf 'PASS  %-46s\n' "B27 byte-identical to the source"; pass=$((pass + 1))
+else
+    printf 'FAIL  %-46s\n' "B27 byte-identical to the source"; fail=$((fail + 1))
+fi
+for want in ga-locate ga-updatedb area-locate area-updatedb; do
+    if [ -L "${dest}/${want}" ]; then
+        printf 'PASS  %-46s\n' "B27 ${want} placed with it"; pass=$((pass + 1))
+    else
+        printf 'FAIL  %-46s\n' "B27 ${want} placed with it"; fail=$((fail + 1))
+    fi
+done
+
+# The deployed copy runs, and its links resolve to it rather than to the
+# repository it came from.
+check "B27 the deployed copy runs"          0 env \
+      DRIVE_INDEX_CONFIG="${work}/grp.ini" \
+      "${dest}/area-locate" beta-two
+
+# Idempotent: a second deployment changes nothing at all.
+contains "B27 a second run places nothing"    "0 link changed" \
+         "$python" "$prog" --config "${work}/grp.ini" --into "$dest" install
+out=$("$python" "$prog" --config "${work}/grp.ini" --into "$dest" \
+      install 2>&1 >/dev/null)
+case $out in
+    *placed*) printf 'FAIL  %-46s\n' "B27 and re-places nothing"
+              fail=$((fail + 1)) ;;
+    *)        printf 'PASS  %-46s\n' "B27 and re-places nothing"
+              pass=$((pass + 1)) ;;
+esac
+
+# A changed source is placed again, so deployment is how a fix travels.
+printf '\n# deployment marker\n' >> "${dest}/drive-index"
+contains "B27 a drifted copy is replaced"     "placed" \
+         "$python" "$prog" --config "${work}/grp.ini" --into "$dest" install
+if cmp -s "$prog" "${dest}/drive-index"; then
+    printf 'PASS  %-46s\n' "B27 and matches the source again"; pass=$((pass + 1))
+else
+    printf 'FAIL  %-46s\n' "B27 and matches the source again"; fail=$((fail + 1))
+fi
+
+# --dry-run touches nothing, which is what makes it safe to look first.
+dry=$(mktemp -d); rm -rf "$dry"
+check "B27 --dry-run reports only"          0 "$python" "$prog" \
+      --config "${work}/grp.ini" --into "$dry" -n install
+if [ -e "$dry" ]; then
+    printf 'FAIL  %-46s\n' "B27 and creates nothing"; fail=$((fail + 1))
+else
+    printf 'PASS  %-46s\n' "B27 and creates nothing"; pass=$((pass + 1))
+fi
+
+# Without --into the old behaviour stands: links beside the running copy.
+check "B27 no --into still links in place"  0 "$python" "$sandbox" install c
+rm -rf "$dest" "$dry"
+
+echo
+printf '%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]
