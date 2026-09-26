@@ -1,6 +1,7 @@
 # A per-OS layer
 
-Status: proposal 2026-09-26, not started
+Status: accepted 2026-09-26, implemented; record in
+doc/decisions/2026-09-26.per-os-and-display.md
 
 ## The gap
 

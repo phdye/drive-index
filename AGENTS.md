@@ -116,7 +116,10 @@ Deployment is one command. The repository is the source of record and
 where it runs from. Editing in one place and running from another without
 that step drifted twice in a single sitting, both times silently.
 
-Not implemented, and written up under `doc/proposal/`: a per-OS layer with
-its own tool paths and database model, `default_drive`, and `trim_prefix`.
-The per-OS layer is the one that matters if this is ever run somewhere other
-than the machine it was written on.
+A config can describe more than one machine. `[os.<name>]` sits between
+`[defaults]` and `[drive.<label>]` and carries what differs between systems
+rather than between drives: the `locate` and `updatedb` binaries, the
+database model, which label a bare action means.
+
+Nothing in `doc/proposal/` is now unimplemented code. What remains there is
+fixed mount points, which is an operator change rather than a program one.

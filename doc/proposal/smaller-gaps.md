@@ -1,6 +1,9 @@
 # Smaller gaps, and one that is not code
 
-Status: recommendations 2026-09-26, none started
+Status: accepted 2026-09-26. default_drive and trim_prefix implemented;
+record in doc/decisions/2026-09-26.per-os-and-display.md.
+The entry kinds are exercised by config/example.ini. Fixed mount points
+remain open: an operator change no code here can make.
 
 Four items. The first two are small features from the design this program
 grew out of; the third is a kind of entry nothing here exercises; the fourth

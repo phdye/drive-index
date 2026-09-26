@@ -41,6 +41,9 @@ EX_VOLUME = 5
 EX_SUSPECT = 6
 
 ACTIONS = ("locate", "updatedb")
+
+# Stands in for "whatever default_drive names", resolved once config is read.
+DEFAULT = object()
 ADMIN = ("install", "config", "status", "bulk")
 
 QUIET, TERSE, NORMAL, VERBOSE, DEBUG = range(5)
@@ -171,6 +174,12 @@ Every option has an environment counterpart named DRIVE_INDEX_<OPTION>, and
 most may be written in a config file too. Precedence runs option, then
 environment, then config, then the built-in default.
 
+A [os.<name>] section carries what differs between machines rather than
+between drives: where locate and updatedb live, where databases belong, which
+label a bare action means. It sits between [defaults] and [drive.<label>], so
+a label's own setting still wins. <name> is the system name -- Cygwin, Linux
+-- and DRIVE_INDEX_OS overrides it.
+
 Config is read from /etc/{prog}.conf, then the XDG system directories, then
 ~/.{prog}.ini, then $XDG_CONFIG_HOME/{prog}/ -- each merging over the last.
 There is deliberately no per-directory layer: which database belongs to a
@@ -188,6 +197,13 @@ Section keys:
   bulk              no to keep this entry out of a bulk rebuild.
   prunepaths        Replaces the inherited prune set.
   add_prunepaths    Extends it. Neither may contain whitespace.
+  trim_prefix       Strip this from reported paths. A display concern only:
+                    the index keeps the full path, so --existing still
+                    resolves and a hit can still be reached.
+  locate            Path to the locate binary; PATH is used when unset.
+  updatedb          Path to the updatedb binary; likewise.
+  default_drive     Which label a bare `locate` or `updatedb` means. Unset,
+                    a bare action is a usage error rather than a guess.
 
 Exit codes:
   0  success
@@ -248,6 +264,14 @@ def host_name():
 
 
 def os_name():
+    """Which [os.<name>] section applies.
+
+    Overridable through the environment like every other setting, which is
+    also what lets the bar exercise a system it is not running on.
+    """
+    override = os.environ.get("DRIVE_INDEX_OS")
+    if override:
+        return override
     system = platform.system()
     return "Cygwin" if system.startswith("CYGWIN") else system
 
@@ -541,8 +565,16 @@ class Config(object):
         return found
 
     def lookup(self, label, key):
-        """Last layer wins; a label's own section outranks [defaults]."""
-        sections = ["defaults"]
+        """Least specific first, so the most specific section wins.
+
+        [defaults], then the running system's [os.<name>], then the label's
+        own [drive.<label>]. The middle tier exists because the things that
+        differ between machines -- where locate and updatedb live, where
+        databases belong -- are properties of the system rather than of any
+        one drive, and a config shared between two machines cannot say both
+        without it.
+        """
+        sections = ["defaults", "os.%s" % os_name()]
         if label:
             sections.append("drive.%s" % label)
         hit = (None, None)
@@ -636,6 +668,40 @@ class Settings(object):
         return default
 
 
+def tool(settings, name):
+    """Where locate or updatedb lives, resolved like any other setting.
+
+    Named rather than taken from PATH because the two systems this has to run
+    on do not put them in the same place, and a config shared between them
+    has to be able to say both. Checked here rather than left to fail inside
+    subprocess, so the diagnostic can name the key and the file it came from
+    instead of an errno.
+    """
+    value = settings.get(name, default=None)
+    if not value:
+        found = shutil.which(name)
+        if found:
+            return found
+        raise Failure("%s is not on PATH and no path is configured for it"
+                      % name, EX_TOOL, [
+                          "set %s in [defaults], or in [os.%s] where the two "
+                          "systems differ" % (name, os_name()),
+                          "config files read: %s"
+                          % (", ".join(settings.config.files()) or "none"),
+                      ])
+    resolved = expand(value)
+    if not os.path.isfile(resolved):
+        where, contents = nearest_existing(resolved)
+        detail = ["configured as: %s" % value,
+                  "came from: %s" % settings.source.get(name, "default")]
+        if where:
+            detail.append("deepest existing ancestor: %s" % where)
+            detail.append("  holding: %s" % (", ".join(contents) or "<empty>"))
+        detail.extend(environment_facts())
+        raise Failure("no such %s: %s" % (name, resolved), EX_TOOL, detail)
+    return resolved
+
+
 def expand(path):
     """Tilde only, deliberately.
 
@@ -701,6 +767,7 @@ class Drive(object):
         self.log = expand(settings.get(
             "log", default="~/log/%s/%s-updatedb.log" % (PROG, self.label)))
         self.prune = self._prune_set()
+        self.trim_prefix = expand(settings.get("trim_prefix", default=None))
 
     def _database(self):
         explicit = self.settings.get(
@@ -822,9 +889,9 @@ def run(argv, reporter, stderr_to=None):
         return subprocess.run(argv, stderr=handle)
 
 
-def index_count(database, reporter):
+def index_count(database, reporter, locate="locate"):
     """How many paths an index holds, or None if locate will not say."""
-    result = run(["locate", "-d", database, "-c", "--regex", "."], reporter)
+    result = run([locate, "-d", database, "-c", "--regex", "."], reporter)
     if result.returncode > 1:
         return None
     try:
@@ -954,7 +1021,7 @@ def do_locate(drive, config, settings, reporter, patterns, extra=(),
 
     passed = locate_passthrough(settings, extra)
     databases = ":".join(d.database for d in drives)
-    argv = ["locate", "-d", databases]
+    argv = [tool(settings, "locate"), "-d", databases]
     if settings.get("ignore-case", default=False, kind=as_bool):
         argv.append("-i")
     if settings.get("existing", default=False, kind=as_bool):
@@ -991,6 +1058,10 @@ def do_locate(drive, config, settings, reporter, patterns, extra=(),
                 "%s changes what locate emits, so there are no paths to "
                 "wrap" % ", ".join(o for o in passed if o in SHAPE_CHANGING),
             ])
+        if any(d.trim_prefix for d in drives):
+            reporter.say(NORMAL, "trim_prefix does not apply to this output; "
+                                 "locate is emitting something other than "
+                                 "one path per line")
         emit(result.stdout or "", settings.get("output", default="-"),
              reporter)
         return EX_OK if result.returncode == 0 else EX_FAIL
@@ -999,7 +1070,39 @@ def do_locate(drive, config, settings, reporter, patterns, extra=(),
     return _report_hits(hits, drives, settings, reporter)
 
 
+def trim(hits, drives, reporter):
+    """Strip a configured prefix from reported paths.
+
+    A display concern, never an index one: the full path is what was stored
+    and what --existing checks, and only what is printed changes. Indexing a
+    tree through an installation root records paths nobody can paste back.
+
+    The longest matching prefix wins, because one label's root may sit inside
+    another's. Searching several indexes at once means the hit cannot be
+    attributed to the index it came from, so every participating prefix is
+    tried -- which is right when the roots are distinct and is why a trim
+    that would strip an unrelated path is a configuration mistake rather than
+    something this can detect.
+    """
+    prefixes = sorted((d.trim_prefix for d in drives if d.trim_prefix),
+                      key=len, reverse=True)
+    if not prefixes:
+        return hits
+    trimmed = []
+    for hit in hits:
+        for prefix in prefixes:
+            if hit.startswith(prefix):
+                hit = hit[len(prefix):] or "/"
+                if not hit.startswith("/"):
+                    hit = "/" + hit
+                break
+        trimmed.append(hit)
+    reporter.say(VERBOSE, "trimmed against %s" % ", ".join(prefixes))
+    return trimmed
+
+
 def _report_hits(hits, drives, settings, reporter):
+    hits = trim(hits, drives, reporter)
     shape = settings.get("format", default=None)
     if shape == "json":
         body = json.dumps({"index": [d.database for d in drives],
@@ -1075,7 +1178,7 @@ def _build(drive, settings, reporter):
     a disk that is not attached to check against.
     """
     temporary = drive.database + ".new"
-    argv = ["updatedb", "--output=" + temporary,
+    argv = [tool(settings, "updatedb"), "--output=" + temporary,
             "--localpaths=" + drive.root]
     if drive.prune:
         argv.append("--prunepaths=" + " ".join(drive.prune))
@@ -1092,7 +1195,8 @@ def _build(drive, settings, reporter):
         if directory and not os.path.isdir(directory):
             os.makedirs(directory)
 
-    was = _previous(drive, reporter)
+    locate = tool(settings, "locate")
+    was = _previous(drive, reporter, locate)
     if os.path.exists(temporary):
         reporter.say(VERBOSE, "discarding a leftover %s" % temporary)
         os.remove(temporary)
@@ -1114,17 +1218,18 @@ def _build(drive, settings, reporter):
                           % drive.database if was else
                           "no previous index existed",
                       ])
-    return _accept(drive, settings, reporter, temporary, was, elapsed)
+    return _accept(drive, settings, reporter, temporary, was, elapsed,
+                   locate)
 
 
-def _previous(drive, reporter):
+def _previous(drive, reporter, locate):
     """Size and entry count of the index about to be replaced, if any."""
     if not os.path.isfile(drive.database):
         return None
     meta = read_meta(drive.database)
     return {"size": os.path.getsize(drive.database),
             "count": meta.get("count") or index_count(drive.database,
-                                                      reporter)}
+                                                      reporter, locate)}
 
 
 def _discard(temporary):
@@ -1134,7 +1239,8 @@ def _discard(temporary):
         pass
 
 
-def _accept(drive, settings, reporter, temporary, was, elapsed):
+def _accept(drive, settings, reporter, temporary, was, elapsed,
+            locate="locate"):
     """Refuse a result that collapsed, unless told to take it anyway.
 
     An index that went from 129 MB to nothing is never what was wanted, and
@@ -1142,7 +1248,7 @@ def _accept(drive, settings, reporter, temporary, was, elapsed):
     Refusing costs a rerun; accepting costs the only copy.
     """
     size = os.path.getsize(temporary) if os.path.exists(temporary) else 0
-    count = index_count(temporary, reporter)
+    count = index_count(temporary, reporter, locate)
     forced = settings.get("force", default=False, kind=as_bool)
 
     reasons = []
@@ -1440,6 +1546,7 @@ def do_config(config, settings, reporter, words):
             "log": drive.log,
             "prune": drive.prune,
             "volume": drive.volume or "",
+            "trim_prefix": drive.trim_prefix or "",
             "removable": drive.removable,
             "imported": drive.imported,
             "bulk": drive.in_bulk,
@@ -1482,6 +1589,8 @@ def do_config(config, settings, reporter, words):
                  if on]
         if entry["volume"]:
             marks.append("volume %s" % entry["volume"])
+        if entry["trim_prefix"]:
+            marks.append("trim %s" % entry["trim_prefix"])
         if marks:
             lines.append("  %-9s %s" % ("flags", ", ".join(marks)))
     emit("\n".join(lines) + "\n", settings.get("output", default="-"),
@@ -1582,6 +1691,12 @@ def dispatch_from_name(argv0, words):
         ])
 
     head = words[0]
+    # A bare action, with no label at all. Only usable where config says what
+    # it means: guessing would search one thing while the caller believed it
+    # had searched another, which is the failure this program spends most of
+    # its care avoiding.
+    if head in ACTIONS:
+        return DEFAULT, head, words[1:]
     # A label may share a name with an admin verb -- `install` is a plausible
     # name for a tree and is one in use. The second word decides: followed by
     # an action it is a label, otherwise it is the verb. Nothing is ambiguous
@@ -1646,11 +1761,29 @@ def main(argv):
     label, action, rest = dispatch_from_name(argv[0], args.words)
 
     config = load_config(args, reporter)
+    defaulted = False
+    if label is DEFAULT:
+        label = config.lookup(None, "default_drive")[0]
+        if not label:
+            raise UsageError("no label given and no default_drive set", [
+                "name one: %s c locate PATTERN" % PROG,
+                "or set default_drive in [defaults], or in [os.%s] where "
+                "two systems differ" % os_name(),
+                "config files read: %s"
+                % (", ".join(config.files()) or "none"),
+            ])
+        label = label.strip()
+        defaulted = True
     label = config.resolve(label)
     reporter.level = volume_from(
         _flags(lambda n: getattr(args, n, None)),
         _flags(lambda n: os.environ.get("DRIVE_INDEX_" + n.upper())),
         _flags(lambda n: config.lookup(label, n)[0]))
+    # Said after the volume is settled, not before: the level is computed
+    # from the label, so anything reported while resolving it would be
+    # measured against a level nobody asked for and swallowed.
+    if defaulted:
+        reporter.say(VERBOSE, "default_drive: %s" % label)
 
     settings = Settings(args, config, label)
     group = config.group.get(label)

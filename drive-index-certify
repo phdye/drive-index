@@ -670,6 +670,135 @@ fi
 check "B27 no --into still links in place"  0 "$python" "$sandbox" install t
 rm -rf "$dest" "$dry"
 
+
+#-----------------------------------------------------------------------------
+# B28 -- the per-OS layer. What differs between machines is a property of the
+# system, not of any one drive, and a shared config has to say both.
+#-----------------------------------------------------------------------------
+
+cat > "${fix}/os.ini" <<INI
+[defaults]
+db_file_model = ${fix}/default-{name}.db
+[os.Fictional]
+db_file_model = ${fix}/fictional-{name}.db
+[drive.t]
+root = ${fix}/tree
+INI
+contains "B28 the matching os section wins"   "fictional-t.db" env \
+         DRIVE_INDEX_OS=Fictional "$python" "$prog" \
+         --config "${fix}/os.ini" config t
+contains "B28 and a non-matching one is inert" "default-t.db" env \
+         DRIVE_INDEX_OS=Elsewhere "$python" "$prog" \
+         --config "${fix}/os.ini" config t
+
+# A label's own section still outranks the system's.
+cat > "${fix}/os2.ini" <<INI
+[os.Fictional]
+db_file_model = ${fix}/fictional-{name}.db
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/explicit.db
+INI
+contains "B28 a drive outranks its os section" "explicit.db" env \
+         DRIVE_INDEX_OS=Fictional "$python" "$prog" \
+         --config "${fix}/os2.ini" config t
+
+# The tools themselves are configurable, which is the half with teeth.
+cat > "${fix}/tool.ini" <<INI
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/t.db
+[os.Fictional]
+locate = ${fix}/no-such-locate
+INI
+check "B28 a missing tool is its own failure" 4 env \
+      DRIVE_INDEX_OS=Fictional "$python" "$prog" \
+      --config "${fix}/tool.ini" t locate alpha-file
+contains "B28 and names the configured value"  "configured as:" env \
+         DRIVE_INDEX_OS=Fictional "$python" "$prog" \
+         --config "${fix}/tool.ini" t locate alpha-file
+# A configured tool that does exist is the one that runs.
+printf '#!/bin/sh\nexit 7\n' > "${fix}/fake-locate"
+chmod 755 "${fix}/fake-locate"
+sed "s|no-such-locate|fake-locate|" "${fix}/tool.ini" > "${fix}/tool2.ini"
+check "B28 a configured tool is used"       4 env \
+      DRIVE_INDEX_OS=Fictional "$python" "$prog" \
+      --config "${fix}/tool2.ini" t locate alpha-file
+
+#-----------------------------------------------------------------------------
+# B29 -- default_drive. A bare action means something only where config says
+# what; guessing would search one thing while the caller believed another.
+#-----------------------------------------------------------------------------
+
+check "B29 a bare action with no default"   2 "$python" "$prog" \
+      --config "${fix}/os2.ini" locate alpha-file
+contains "B29 and says what would fix it"     "default_drive" \
+         "$python" "$prog" --config "${fix}/os2.ini" locate alpha-file
+
+cat > "${fix}/dd.ini" <<INI
+[defaults]
+default_drive = t
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/t.db
+INI
+check "B29 a bare action uses the default"  0 "$python" "$prog" \
+      --config "${fix}/dd.ini" locate alpha-file
+check "B29 and a named label still wins"    1 "$python" "$prog" \
+      --config "${fix}/dd.ini" --db "${fix}/imp.db" t locate zzq-nothing
+contains "B29 the default is reported"        "default_drive: t" \
+         "$python" "$prog" --config "${fix}/dd.ini" -v locate alpha-file
+
+# It may name a group, since a group is just an indirection to labels.
+cat > "${fix}/ddg.ini" <<INI
+[defaults]
+default_drive = pair
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/t.db
+[drive.imp]
+database = ${fix}/imp.db
+[group.pair]
+member.one = t
+member.two = imp
+INI
+check "B29 a default naming a group"        0 "$python" "$prog" \
+      --config "${fix}/ddg.ini" locate alpha-file
+check "B29 and its selector still narrows"  0 "$python" "$prog" \
+      --config "${fix}/ddg.ini" --one locate alpha-file
+
+#-----------------------------------------------------------------------------
+# B30 -- trim_prefix. A display concern: the index keeps the full path.
+#-----------------------------------------------------------------------------
+
+cat > "${fix}/trim.ini" <<INI
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/t.db
+trim_prefix = ${fix}/tree
+INI
+TR=( "$python" "$prog" --config "${fix}/trim.ini" )
+contains "B30 the prefix is stripped"         "/alpha-file" "${TR[@]}" \
+         t locate alpha-file
+out=$("${TR[@]}" t locate alpha-file 2>/dev/null)
+case $out in
+    "${fix}"*) printf 'FAIL  %-46s\n' "B30 and the root is gone from it"
+               fail=$((fail + 1)) ;;
+    *)         printf 'PASS  %-46s\n' "B30 and the root is gone from it"
+               pass=$((pass + 1)) ;;
+esac
+# What was stored is untouched: --existing still resolves the real file.
+check "B30 the index still holds full paths" 0 "${TR[@]}" -e t locate alpha-file
+contains "B30 json carries trimmed paths"     '"/alpha-file"' "${TR[@]}" \
+         --json t locate alpha-file
+contains "B30 -c says trimming cannot apply"  "does not apply" "${TR[@]}" \
+         -c t locate alpha-file
+
+
+# Every resolved value is inspectable, trim_prefix included.
+contains "B30 config reports the trim"        "trim ${fix}/tree" "${TR[@]}" \
+         config t
+
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
