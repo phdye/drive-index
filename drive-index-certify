@@ -14,11 +14,70 @@ python=${1:-python3}
 pass=0
 fail=0
 
-# Symlinks are made in a sandbox rather than beside the program. A bar that
-# installs into its own directory leaves artifacts in the working tree and
-# only passes where a deployment already exists; this one runs anywhere.
+# findutils is a real dependency and worth saying so once, rather than as
+# twenty confusing failures further down.
+for tool in locate updatedb; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf '%s: %s not found; GNU findutils is required\n' \
+            "$(basename -- "$0")" "$tool" >&2
+        exit 2
+    }
+done
+
 bin=$(mktemp -d)
-trap 'rm -rf "$bin"' EXIT
+fix=$(mktemp -d)
+trap 'rm -rf "$bin" "$fix"' EXIT
+
+# Everything runs against a fixture, never against whatever this machine
+# happens to be configured with. HOME is redirected as well as the config,
+# so a check that forgets to isolate itself fails against an empty scratch
+# home rather than passing against somebody's real one -- which is exactly
+# how a broken alias once hid behind a live config entry. It also keeps the
+# default log path, ~/log/drive-index, out of the operator's home.
+export HOME="$fix"
+export DRIVE_INDEX_CONFIG="${fix}/fixture.ini"
+unset DRIVE_INDEX_DB DRIVE_INDEX_ROOT DRIVE_INDEX_VERBOSE DRIVE_INDEX_QUIET
+
+mkdir -p "${fix}/tree/nested"
+: > "${fix}/tree/alpha-file"
+: > "${fix}/tree/beta-file"
+: > "${fix}/tree/nested/alpha-beta-gamma"
+: > "${fix}/tree/nested/delta-file"
+
+cat > "${fix}/fixture.ini" <<INI
+[defaults]
+db_file_model = ${fix}/{name}.db
+
+[drive.t]
+root = ${fix}/tree
+database = ${fix}/t.db
+
+[drive.imp]
+database = ${fix}/imp.db
+
+[drive.volatile]
+root = ${fix}/tree
+database = ${fix}/volatile.db
+bulk = no
+INI
+
+# t is built for real, so the checks that search it are searching an index
+# this program made. imp is that index copied, with a note dated far enough
+# back to be stale -- staleness then comes from the fixture rather than from
+# whenever anyone last rebuilt something.
+"$python" "$prog" --log "${fix}/build.log" t updatedb >/dev/null 2>&1
+cp "${fix}/t.db" "${fix}/imp.db"
+"$python" - "$fix" <<'PY'
+import json, os, sys, time
+fix = sys.argv[1]
+record = {"name": "imp", "host": "elsewhere", "os": "Linux",
+          "root": "/on/another/machine",
+          "built": int(time.time() - 200 * 86400),
+          "count": None, "tool": "drive-index fixture"}
+with open(os.path.join(fix, "imp.db.meta"), "w") as handle:
+    handle.write(json.dumps(record, indent=2) + "\n")
+PY
+
 cp "$prog" "${bin}/drive-index"
 chmod 755 "${bin}/drive-index"
 sandbox="${bin}/drive-index"
@@ -73,18 +132,19 @@ check "B5  no action is a usage error"      2 "$python" "$prog"
 contains "B5  and names both ways in"      "<label>-<action>" \
          "$python" "$prog"
 check "B5  drive with no action"            2 "$python" "$prog" c
-check "B5  unknown action"                  2 "$python" "$prog" c frobnicate
+check "B5  unknown action"                  2 "$python" "$prog" t frobnicate
 
 # B6 -- the everyday path, through the symlink and under the program's name.
-check "B6  c-locate finds something"        0 "${bin}/c-locate" bash
-check "B6  no match exits 1"                1 "${bin}/c-locate" \
+check "B6  a symlink finds something"           0 "${bin}/t-locate" alpha-file
+check "B6  no match exits 1"                1 "${bin}/t-locate" \
       zzq-nothing-is-named-this-zzq
-check "B6  same under the program name"     0 "$python" "$prog" c locate bash
+check "B6  same under the program name"     0 "$python" "$prog" \
+      t locate alpha-file
 
 # B7 -- the defect the old script carried: a clean run must not exit non-zero.
-check "B7  updatedb --dry-run exits 0"      0 "${bin}/c-updatedb" --dry-run
+check "B7  updatedb --dry-run exits 0"      0 "${bin}/t-updatedb" --dry-run
 contains "B7  and shows the command"          "updatedb --output=" \
-         "${bin}/c-updatedb" -n
+         "${bin}/t-updatedb" -n
 
 # B7b -- the defect itself. A dry run proves the pipeline is gone; only a real
 # build that succeeds proves a successful build no longer exits non-zero. Over
@@ -98,26 +158,26 @@ check "B7  and what it built is searchable" 0 "$python" "$prog" \
 rm -rf "$tmp"
 
 # B8 -- idempotency: the second run changes nothing.
-check "B8  install is repeatable"           0 "$python" "$sandbox" install c
+check "B8  install is repeatable"           0 "$python" "$sandbox" install t
 contains "B8  second run reports no change"   "0 link changed" \
-         "$python" "$sandbox" -v install c
+         "$python" "$sandbox" -v install t
 
 # B9 -- a missing database is its own exit code, and the message says where
 # the bad value came from rather than leaving the reader to guess.
 check "B9  missing database exits 3"        3 "$python" "$prog" \
-      --db /nowhere/at/all.db c locate bash
+      --db /nowhere/at/all.db t locate alpha-file
 contains "B9  names the provenance"           "came from: option" \
-         "$python" "$prog" --db /nowhere/at/all.db c locate bash
+         "$python" "$prog" --db /nowhere/at/all.db t locate alpha-file
 contains "B9  names the nearest real path"    "deepest existing ancestor" \
-         "$python" "$prog" --db /nowhere/at/all.db c locate bash
+         "$python" "$prog" --db /nowhere/at/all.db t locate alpha-file
 
 # B10 -- precedence: the option outranks the environment variable.
 DRIVE_INDEX_DB=/nowhere/from/env.db \
     contains "B10 option beats environment" "at/all.db" \
-    "$python" "$prog" --db /nowhere/at/all.db c locate bash
+    "$python" "$prog" --db /nowhere/at/all.db t locate alpha-file
 DRIVE_INDEX_DB=/nowhere/from/env.db \
     contains "B10 environment is used when alone" "environment DRIVE_INDEX_DB" \
-    "$python" "$prog" c locate bash
+    "$python" "$prog" t locate alpha-file
 
 # B11 -- CRLF would break the shebang line under Cygwin, silently.
 if grep -qU $'\r' "$prog"; then
@@ -127,25 +187,25 @@ else
 fi
 
 # B12 -- the short-option forms a hand-rolled parser always drops.
-check "B12 bundled flags (-qv)"             0 "${bin}/c-locate" -qv bash
-check "B12 attached short value (-l2)"      0 "${bin}/c-locate" -l2 bash
-check "B12 separated short value (-l 2)"    0 "${bin}/c-locate" -l 2 bash
+check "B12 bundled flags (-qv)"             0 "${bin}/t-locate" -qv alpha-file
+check "B12 attached short value (-l2)"      0 "${bin}/t-locate" -l2 alpha-file
+check "B12 separated short value (-l 2)"    0 "${bin}/t-locate" -l 2 alpha-file
 
 # Guards on the two format flags and on the whitespace prune path.
-check "two format flags is a usage error"   2 "${bin}/c-locate" \
-      --json --porcelain bash
-check "whitespace prune path is refused"    2 "${bin}/c-updatedb" \
+check "two format flags is a usage error"   2 "${bin}/t-locate" \
+      --json --porcelain alpha-file
+check "whitespace prune path is refused"    2 "${bin}/t-updatedb" \
       --prune '/c/System Volume Information'
 
 # B13 -- the label is a label, not a letter, and an imported index has no
 # build side. Exit 1 here means locate ran and matched nothing, which is what
-# proves the dispatch found 4tb's database; exit 3 would mean it did not.
-check "B13 digit-led label dispatches"      1 "${bin}/4tb-locate" \
+# proves the dispatch found the imported database; 3 would mean it did not.
+check "B13 digit-led label dispatches"      1 "${bin}/imp-locate" \
       zzq-nothing-is-named-this-zzq
-check "B13 imported index refuses a build"  2 "$python" "$prog" 4tb updatedb
+check "B13 imported index refuses a build"  2 "$python" "$prog" imp updatedb
 contains "B13 and says why"                   "imported index" \
-         "$python" "$prog" 4tb updatedb
-if [ -e "${bin}/4tb-updatedb" ]; then
+         "$python" "$prog" imp updatedb
+if [ -e "${bin}/imp-updatedb" ]; then
     printf 'FAIL  %-46s\n' "B13 no updatedb link for an import"
     fail=$((fail + 1))
 else
@@ -159,9 +219,9 @@ empty=$(mktemp)
 check "B14 drive works with no config"      0 "$python" "$prog" \
       --config "$empty" c locate bash
 check "B14 non-drive with no config is 2"   2 "$python" "$prog" \
-      --config "$empty" 4tb locate bash
-contains "B14 and names the section wanted"   "[drive.4tb]" \
-         "$python" "$prog" --config "$empty" 4tb locate bash
+      --config "$empty" imp locate alpha-file
+contains "B14 and names the section wanted"   "[drive.imp]" \
+         "$python" "$prog" --config "$empty" imp locate alpha-file
 rm -f "$empty"
 
 #-----------------------------------------------------------------------------
@@ -296,33 +356,33 @@ contains "B21 --all joins the indexes held"   ".db:" \
          "$python" "$prog" -a --debug c locate zzq-nothing-is-named-this-zzq
 
 # B22 -- a bulk sweep leaves out what should not be swept.
-contains "B22 bulk skips bulk = no"           "skipped registry" \
-         "$python" "$prog" -v bulk registry
-contains "B22 bulk skips an import"           "skipped 4tb" \
-         "$python" "$prog" -v bulk 4tb
+contains "B22 bulk skips bulk = no"           "skipped volatile" \
+         "$python" "$prog" -v bulk volatile
+contains "B22 bulk skips an import"           "skipped imp" \
+         "$python" "$prog" -v bulk imp
 
 # B23 -- status reports machine-readably too.
 check "B23 status --json"                   0 "$python" "$prog" \
       --json status c
 contains "B23 and marks the import"           "\"imported\": true" \
-         "$python" "$prog" --json status 4tb
+         "$python" "$prog" --json status imp
 
 # B24 -- a wrapper must not narrow the tool it wraps. Every locate option
 # this program has no opinion about goes straight through.
-check "B24 -r reaches locate"               0 "${bin}/c-locate" \
-      -r 'dri.e-inde.'
-check "B24 -b reaches locate"               0 "${bin}/c-locate" \
-      -b drive-index
-check "B24 -A reaches locate"               0 "${bin}/c-locate" \
-      -A drive index
-check "B24 -r with no match still exits 1"  1 "${bin}/c-locate" \
+check "B24 -r reaches locate"               0 "${bin}/t-locate" \
+      -r 'alph..file'
+check "B24 -b reaches locate"               0 "${bin}/t-locate" \
+      -b alpha-file
+check "B24 -A reaches locate"               0 "${bin}/t-locate" \
+      -A alpha beta
+check "B24 -r with no match still exits 1"  1 "${bin}/t-locate" \
       -r 'zzq.*nothing.*zzq'
 contains "B24 --regextype takes its value"    "--regextype=posix-egrep" \
-         "${bin}/c-locate" --debug --regextype posix-egrep -r 'dri.e-inde.'
+         "${bin}/t-locate" --debug --regextype posix-egrep -r 'alph..file'
 
 # -c changes what locate emits, so the count must pass through rather than
 # being read back as though it were a path.
-out=$("${bin}/c-locate" -c drive-index 2>/dev/null)
+out=$("${bin}/t-locate" -c alpha-file 2>/dev/null)
 case $out in
     ''|*[!0-9]*)
         printf 'FAIL  %-46s (%q)\n' "B24 -c yields a bare count" "$out"
@@ -331,22 +391,23 @@ case $out in
         printf 'PASS  %-46s\n' "B24 -c yields a bare count"
         pass=$((pass + 1)) ;;
 esac
-check "B24 -c with --json is refused"       2 "${bin}/c-locate" \
-      --json -c drive-index
+check "B24 -c with --json is refused"       2 "${bin}/t-locate" \
+      --json -c alpha-file
 
 # locate rejects what it does not know, in its own words rather than ours.
-check "B24 a bogus option still fails"      4 "${bin}/c-locate" \
-      --no-such-locate-option drive-index
+check "B24 a bogus option still fails"      4 "${bin}/t-locate" \
+      --no-such-locate-option alpha-file
 # An action that never runs locate has nothing to hand them to.
-check "B24 updatedb rejects passthrough"    2 "${bin}/c-updatedb" -r foo
+check "B24 updatedb rejects passthrough"    2 "${bin}/t-updatedb" -r foo
 check "B24 status rejects passthrough"      2 "$python" "$prog" -r foo status
 
 # A stale index must not make a search look like a failure. This is the
-# regression for the discriminator above: 4tb is well past locate's own
-# eight-day warning threshold, and searching it is still a search.
-check "B24 stale index still searches"      1 "${bin}/4tb-locate" \
+# regression for the discriminator above: the fixture's imported index is
+# 200 days old, well past locate's own warning threshold, and searching it
+# is still a search.
+check "B24 stale index still searches"      1 "${bin}/imp-locate" \
       zzq-nothing-is-named-this-zzq
-check "B24 stale index with a hit"          0 "${bin}/4tb-locate" -l 1 e
+check "B24 stale index with a hit"          0 "${bin}/imp-locate" -l 1 alpha
 
 # B25 -- a label may share a name with an admin verb, and aliases need
 # symlinks of their own or they are only reachable the way nobody uses.
@@ -606,7 +667,7 @@ else
 fi
 
 # Without --into the old behaviour stands: links beside the running copy.
-check "B27 no --into still links in place"  0 "$python" "$sandbox" install c
+check "B27 no --into still links in place"  0 "$python" "$sandbox" install t
 rm -rf "$dest" "$dry"
 
 echo

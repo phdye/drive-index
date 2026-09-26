@@ -81,6 +81,18 @@ oldest one available. Every defect fixed gets a check that fails without the
 fix; the bar is currently the most valuable artifact here, because three
 separate defects in it reported green while the code was wrong.
 
+It runs entirely against a fixture it builds, with `HOME` and
+`DRIVE_INDEX_CONFIG` redirected into a scratch directory. Nothing it does
+reads or writes the machine's own configuration, so it passes on a clean
+checkout and cannot quietly depend on whoever is running it. Redirecting
+`HOME` as well as the config is deliberate: a check that forgets to isolate
+itself then fails against an empty scratch home rather than passing against a
+real one, which is how a broken alias once hid behind a live config entry.
+
+    env -i PATH=/usr/bin:/bin ./drive-index-certify
+
+is the check that it is still true.
+
 **`--help` prints the hand-written Usage block verbatim** rather than
 argparse's rendering. The two are separate artifacts and nothing keeps them
 in sync, so the text a caller reads is at least the text that was reviewed.
